@@ -71,6 +71,8 @@ The compiled binary will be available at `./target/release/enzato`.
 
 ---
 
+The author of the Enzato text editor is R. H. A. Ashan Imalka.
+
 ## 🤝 Contributing & Stars
 
 If you like this ultra-lean text editor architecture, please **drop a ⭐ Star** on the repository! It helps more developers discover high-performance open-source tools.
