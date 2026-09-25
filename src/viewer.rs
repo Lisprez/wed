@@ -112,7 +112,7 @@ impl Viewer {
         let filename = engine.filepath.as_deref().unwrap_or("[No Name]");
         let (row, col) = engine.buffer.line_col_at_idx(engine.cursor_char_idx);
         
-        let left_info = format!(" Enzato - {}{} ", filename, dirty_indicator);
+        let left_info = format!(" wed - {}{} ", filename, dirty_indicator);
         let right_info = format!(" Line: {}, Col: {} ", row + 1, col + 1);
         
         let width = self.width as usize;

@@ -1,10 +1,10 @@
-# 🛡️ Enzato
+# 🛡️ wed
 
 [![Performance](https://img.shields.io/badge/Latency-0.68ms-brightgreen)](#-performance-benchmarks)
 [![Security](https://img.shields.io/badge/Microsoft_Defender-Verified_Clean-blue)](#-security--false-positive-verification)
 [![Language](https://img.shields.io/badge/Built_With-Rust-orange)](https://www.rust-lang.org/)
 
-Enzato is an ultra-lightweight, blazing-fast, terminal-based text editor built from scratch in Rust. Powered by a high-performance **Gap Buffer architecture**, Enzato delivers instant, constant-time $O(1)$ local text insertion and deletion, making it highly responsive even under massive document loads.
+wed is an ultra-lightweight, blazing-fast, terminal-based text editor built from scratch in Rust. Powered by a high-performance **Gap Buffer architecture**, wed delivers instant, constant-time $O(1)$ local text insertion and deletion, making it highly responsive even under massive document loads.
 
 Designed for developers who value minimal resource consumption, extreme speed, and absolute clean security.
 
@@ -22,7 +22,7 @@ Designed for developers who value minimal resource consumption, extreme speed, a
 
 ## 🚀 Performance Benchmarks
 
-Enzato has been programmatically stressed with heavy text loads up to **50 MB** under native production environments. The results prove its architectural efficiency:
+wed has been programmatically stressed with heavy text loads up to **50 MB** under native production environments. The results prove its architectural efficiency:
 
 | File Size | Load Latency ($T_{	ext{start}}$) | RAM Footprint ($M_{	ext{active}}$) | Scaling Efficiency |
 | :--- | :--- | :--- | :--- |
@@ -36,9 +36,9 @@ Enzato has been programmatically stressed with heavy text loads up to **50 MB** 
 
 ## 🛡️ Security & False Positive Verification
 
-Enzato prioritizes absolute security transparency. Our compiled release binaries are clean, open-source, and verified directly at the engine level. 
+wed prioritizes absolute security transparency. Our compiled release binaries are clean, open-source, and verified directly at the engine level.
 
-To guarantee immediate trust on Windows platforms, Enzato's binary has been formally analyzed and whitelisted by **Microsoft Security Intelligence**:
+To guarantee immediate trust on Windows platforms, wed's binary has been formally analyzed and whitelisted by **Microsoft Security Intelligence**:
 
 - **Submission Status:** Completed / Clean (Not Malware)
 - **Microsoft Submission ID:** `1311234b-5a50-497e-875d-f6a374ad9df4`
@@ -61,17 +61,17 @@ Ensure you have the Rust toolchain installed.
 ### Building from Source
 ```bash
 # Clone the repository
-git clone https://github.com/scxr-dev/enzato.git
-cd enzato
+git clone https://github.com/scxr-dev/wed.git
+cd wed
 
 # Build the release profile
 cargo build --release
 ```
-The compiled binary will be available at `./target/release/enzato`.
+The compiled binary will be available at `./target/release/wed`.
 
 ---
 
-The author of the Enzato text editor is R. H. A. Ashan Imalka.
+The author of the wed text editor is R. H. A. Ashan Imalka.
 
 ## 🤝 Contributing & Stars
 

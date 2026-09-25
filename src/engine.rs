@@ -41,7 +41,7 @@ impl Engine {
             prompt_input: String::new(),
             search_matches: Vec::new(),
             current_match_idx: 0,
-            status_message: "Welcome to Enzato | Ctrl+S: Save | Ctrl+Q: Quit | Ctrl+F: Find".to_string(),
+            status_message: "Welcome to wed | Ctrl+S: Save | Ctrl+Q: Quit | Ctrl+F: Find".to_string(),
             selection_start: None,
         }
     }

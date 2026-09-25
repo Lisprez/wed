@@ -1,26 +1,27 @@
-mod buffer;
-mod clipboard;
-mod engine;
-mod history;
-mod viewer;
+mod app;
+mod render;
 
-use std::io::{self, stdout};
-use std::panic;
-use std::time::Duration;
+use app::{App, AppOutcome};
 use crossterm::{
     event::{self, Event, KeyEventKind},
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
     ExecutableCommand,
 };
-use engine::Engine;
-use viewer::Viewer;
+use render::Renderer;
+use std::io::{self, stdout};
+use std::panic;
+use std::path::PathBuf;
+use std::time::Duration;
 
 struct RawModeGuard;
 
 impl RawModeGuard {
     fn new() -> io::Result<Self> {
         enable_raw_mode()?;
-        stdout().execute(EnterAlternateScreen)?;
+        if let Err(error) = stdout().execute(EnterAlternateScreen) {
+            let _ = disable_raw_mode();
+            return Err(error);
+        }
         Ok(Self)
     }
 }
@@ -41,29 +42,26 @@ fn main() -> io::Result<()> {
         eprintln!("Fatal error: {:?}", info);
     }));
 
-    let mut engine = Engine::new();
-    if let Some(filepath) = std::env::args().nth(1) {
-        let _ = engine.load_file(&filepath);
-    }
-
-    let mut viewer = Viewer::new()?;
-    viewer.render(&engine)?;
+    let path = std::env::args_os().nth(1).map(PathBuf::from);
+    let mut app = App::new(path)?;
+    let mut renderer = Renderer::new()?;
+    renderer.render(&app)?;
 
     loop {
         if event::poll(Duration::from_millis(8))? {
             match event::read()? {
-                Event::Key(key_event) => {
-                    if key_event.kind == KeyEventKind::Release {
+                Event::Key(key) => {
+                    if key.kind == KeyEventKind::Release {
                         continue;
                     }
-                    if engine.handle_key(key_event) {
+                    if app.handle_key(key)? == AppOutcome::Quit {
                         break;
                     }
-                    viewer.render(&engine)?;
+                    renderer.render(&app)?;
                 }
                 Event::Resize(width, height) => {
-                    viewer.resize(width, height);
-                    viewer.render(&engine)?;
+                    renderer.resize(width, height);
+                    renderer.render(&app)?;
                 }
                 _ => {}
             }
