@@ -176,6 +176,7 @@ pub struct Editor {
     last_find: Option<(FindKind, char)>,
     replace_pending: bool,
     unnamed_register: Option<RegisterValue>,
+    pending_clipboard_text: Option<String>,
 }
 
 impl Editor {
@@ -204,6 +205,7 @@ impl Editor {
             last_find: None,
             replace_pending: false,
             unnamed_register: None,
+            pending_clipboard_text: None,
         }
     }
 
@@ -220,6 +222,7 @@ impl Editor {
     }
 
     pub fn handle_key(&mut self, key: Key) -> EditorOutcome {
+        self.pending_clipboard_text = None;
         match self.mode {
             Mode::Normal => self.handle_normal_key(key),
             Mode::Insert => self.handle_insert_key(key),
@@ -232,6 +235,10 @@ impl Editor {
 
     pub fn text(&self) -> String {
         self.document.to_string()
+    }
+
+    pub fn take_clipboard_text(&mut self) -> Option<String> {
+        self.pending_clipboard_text.take()
     }
 
     pub fn search_prompt(&self) -> Option<String> {
@@ -261,6 +268,7 @@ impl Editor {
         self.search_input.clear();
         self.last_search = None;
         self.message.clear();
+        self.pending_clipboard_text = None;
     }
 
     pub fn replace_literal(&mut self, needle: &str, replacement: &str, global: bool) -> usize {
@@ -980,13 +988,14 @@ impl Editor {
                     .collect::<Vec<_>>()
                     .join("\n");
                 self.unnamed_register = Some(RegisterValue {
-                    text,
+                    text: text.clone(),
                     kind: register_kind(match selection.kind {
                         SelectionKind::Characterwise => RangeKind::Characterwise,
                         SelectionKind::Linewise => RangeKind::Linewise,
                         SelectionKind::Blockwise { .. } => RangeKind::Blockwise,
                     }),
                 });
+                self.pending_clipboard_text = Some(text);
                 self.mode = Mode::Normal;
                 self.selection = None;
             }
@@ -1620,6 +1629,35 @@ mod tests {
             &[Key::Char('v'), Key::Char('%'), Key::Char('d')],
         );
         assert_eq!(editor.text(), "");
+    }
+
+    #[test]
+    fn visual_yank_updates_register_and_queues_clipboard_text() {
+        let mut editor = Editor::from_text("é界");
+        keys(
+            &mut editor,
+            &[Key::Char('v'), Key::Char('l'), Key::Char('y')],
+        );
+        assert_eq!(editor.take_clipboard_text().as_deref(), Some("é界"));
+        keys(&mut editor, &[Key::Char('p')]);
+        assert_eq!(editor.text(), "é界é界");
+    }
+
+    #[test]
+    fn visual_line_yank_queues_linewise_clipboard_text() {
+        let mut editor = Editor::from_text("one\ntwo\nthree");
+        keys(&mut editor, &[Key::Char('V'), Key::Char('y')]);
+        assert_eq!(editor.take_clipboard_text().as_deref(), Some("one\n"));
+    }
+
+    #[test]
+    fn visual_block_yank_queues_selected_lines() {
+        let mut editor = Editor::from_text("abc\ndef");
+        keys(
+            &mut editor,
+            &[Key::Ctrl('v'), Key::Char('l'), Key::Down, Key::Char('y')],
+        );
+        assert_eq!(editor.take_clipboard_text().as_deref(), Some("ab\nde"));
     }
 
     #[test]

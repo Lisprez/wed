@@ -4,6 +4,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process;
+use wed::clipboard;
 use wed::core::{Editor, EditorOutcome, Key};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -94,10 +95,24 @@ impl App {
             return Ok(AppOutcome::Continue);
         }
         let key = convert_key(key);
-        match self.editor.handle_key(key) {
-            EditorOutcome::Continue => Ok(AppOutcome::Continue),
-            EditorOutcome::Quit => Ok(AppOutcome::Quit),
+        self.handle_editor_key(key, &clipboard::set_contents)
+    }
+
+    fn handle_editor_key(
+        &mut self,
+        key: Key,
+        set_clipboard: &impl Fn(&str) -> io::Result<()>,
+    ) -> io::Result<AppOutcome> {
+        let outcome = self.editor.handle_key(key);
+        if let Some(text) = self.editor.take_clipboard_text() {
+            if let Err(error) = set_clipboard(&text) {
+                self.editor.message = format!("Clipboard copy failed: {}", error);
+            }
         }
+        Ok(match outcome {
+            EditorOutcome::Continue => AppOutcome::Continue,
+            EditorOutcome::Quit => AppOutcome::Quit,
+        })
     }
 
     pub fn save(&mut self) -> bool {
@@ -357,6 +372,33 @@ mod tests {
                 .slice(selection.ranges(&app.editor.document)[0]),
             "one "
         );
+    }
+
+    #[test]
+    fn visual_yank_updates_register_and_system_clipboard() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let mut app = App::new(None).unwrap();
+        app.editor.replace_text("abcd");
+        let copied = Rc::new(RefCell::new(Vec::new()));
+        let set_clipboard = |text: &str| {
+            copied.borrow_mut().push(text.to_string());
+            Ok::<_, std::io::Error>(())
+        };
+
+        for key in [
+            wed::core::Key::Char('v'),
+            wed::core::Key::Char('l'),
+            wed::core::Key::Char('y'),
+        ] {
+            app.handle_editor_key(key, &set_clipboard).unwrap();
+        }
+
+        assert_eq!(copied.borrow().len(), 1);
+        assert_eq!(copied.borrow()[0], "ab");
+        app.editor.handle_key(wed::core::Key::Char('p'));
+        assert_eq!(app.editor.text(), "abcdab");
     }
 
     #[test]
