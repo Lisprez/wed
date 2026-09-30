@@ -53,7 +53,12 @@ impl History {
         }
     }
 
-    pub fn undo(&mut self, document: &mut Document) -> Option<Transaction> {
+    /// Reverses the most recent transaction and returns the position the cursor
+    /// should move to, if there was one.
+    ///
+    /// The transaction itself moves to the redo stack rather than being copied,
+    /// so undoing a large edit does not duplicate its text.
+    pub fn undo(&mut self, document: &mut Document) -> Option<CharPos> {
         let transaction = self.undo_stack.pop()?;
         for edit in transaction.edits.iter().rev() {
             let current = CharRange::new(
@@ -62,19 +67,26 @@ impl History {
             );
             document.replace_range(current, &edit.removed);
         }
-        self.redo_stack.push(transaction.clone());
-        Some(transaction)
+        let cursor = transaction.edits.first().map(|edit| edit.start);
+        self.redo_stack.push(transaction);
+        cursor
     }
 
-    pub fn redo(&mut self, document: &mut Document) -> Option<Transaction> {
+    /// Reapplies the most recently undone transaction and returns the position
+    /// the cursor should move to, if there was one.
+    pub fn redo(&mut self, document: &mut Document) -> Option<CharPos> {
         let transaction = self.redo_stack.pop()?;
         for edit in &transaction.edits {
             let current =
                 CharRange::new(edit.start, edit.start.advance(edit.removed.chars().count()));
             document.replace_range(current, &edit.inserted);
         }
-        self.undo_stack.push(transaction.clone());
-        Some(transaction)
+        let cursor = transaction
+            .edits
+            .last()
+            .map(|edit| edit.start.advance(edit.inserted.chars().count()));
+        self.undo_stack.push(transaction);
+        cursor
     }
 
     pub fn clear(&mut self) {

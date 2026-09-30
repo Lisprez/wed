@@ -1,7 +1,7 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, OpenOptions};
-use std::io::{self, Write};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process;
 use wed::clipboard;
@@ -131,7 +131,7 @@ impl App {
                 .write(true)
                 .create_new(true)
                 .open(&temporary)?;
-            file.write_all(self.editor.text().as_bytes())?;
+            self.editor.document.write_to(&mut file)?;
             file.sync_all()?;
             fs::rename(&temporary, path)
         })();
@@ -312,6 +312,13 @@ mod tests {
     use super::{App, AppMode};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use std::fs;
+    use wed::core::{Editor, Key};
+
+    fn keys(editor: &mut Editor, keys: &[Key]) {
+        for key in keys {
+            editor.handle_key(*key);
+        }
+    }
 
     #[test]
     fn loads_and_saves_a_file() {
@@ -347,6 +354,24 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Enter, modifiers))
             .unwrap();
         assert_eq!(app.editor.text(), "two two");
+    }
+
+    #[test]
+    fn substitution_is_undoable_and_leaves_the_document_clean_when_redundant() {
+        let mut editor = Editor::from_text("one one");
+        assert_eq!(editor.replace_literal("one", "two", true), 2);
+        assert_eq!(editor.text(), "two two");
+        assert!(editor.is_dirty());
+
+        keys(&mut editor, &[Key::Char('u')]);
+        assert_eq!(editor.text(), "one one");
+
+        // Replacing text with itself must not leave the buffer marked dirty.
+        let mut editor = Editor::from_text("one one");
+        editor.mark_saved();
+        assert_eq!(editor.replace_literal("one", "one", true), 2);
+        assert_eq!(editor.text(), "one one");
+        assert!(!editor.is_dirty());
     }
 
     #[test]

@@ -122,9 +122,12 @@ fn matching_quote_partner(document: &Document, position: usize, quote: char) -> 
     let start = document.line_start(line).0;
     let end = document.line_end(line).0;
     let mut positions = Vec::new();
-    for index in start..end {
-        if document.char_at(CharPos(index)) == Some(quote) && !is_escaped(document, index) {
-            positions.push(index);
+    for (at, character) in document.chars_from(CharPos(start)) {
+        if at.0 >= end {
+            break;
+        }
+        if character == quote && !is_escaped(document, at.0) {
+            positions.push(at.0);
         }
     }
     for pair in positions.chunks(2) {
@@ -227,12 +230,13 @@ fn quote_object(
     let start = document.line_start(line).0;
     let end = document.line_end(line).0;
     let mut quote_positions = Vec::new();
-    let mut index = start;
-    while index < end {
-        if document.char_at(CharPos(index)) == Some(quote) && !is_escaped(document, index) {
-            quote_positions.push(index);
+    for (at, character) in document.chars_from(CharPos(start)) {
+        if at.0 >= end {
+            break;
         }
-        index += 1;
+        if character == quote && !is_escaped(document, at.0) {
+            quote_positions.push(at.0);
+        }
     }
     if quote_positions.len() < 2 {
         return None;
@@ -379,61 +383,58 @@ fn include_adjacent_whitespace(document: &Document, start: usize, end: usize) ->
 
 fn sentence_start_containing(document: &Document, position: usize) -> usize {
     let mut start = 0;
-    let mut index = 0;
-    while index < position {
-        let Some(end) = sentence_boundary_at(document, index) else {
-            index += 1;
+    for (at, character) in document.chars_from(CharPos::ZERO) {
+        let index = at.0;
+        if index >= position {
+            break;
+        }
+        let Some(end) = sentence_boundary_at(document, index, character) else {
             continue;
         };
         if end > position {
             return index;
         }
         start = end;
-        index = end;
     }
     start
 }
 
 fn next_sentence_start(document: &Document, start: usize) -> usize {
-    let len = document.len_chars();
-    let mut index = start;
-    while index < len {
-        if sentence_boundary_at(document, index).is_some() {
-            return index;
+    for (at, character) in document.chars_from(CharPos(start)) {
+        if sentence_boundary_at(document, at.0, character).is_some() {
+            return at.0;
         }
-        index += 1;
     }
-    len
+    document.len_chars()
 }
 
 fn sentence_end_from(document: &Document, start: usize) -> usize {
-    let len = document.len_chars();
-    let mut index = start;
-    while index < len {
-        if let Some(end) = sentence_boundary_at(document, index) {
+    for (at, character) in document.chars_from(CharPos(start)) {
+        if let Some(end) = sentence_boundary_at(document, at.0, character) {
             return end;
         }
-        index += 1;
     }
-    len
+    document.len_chars()
 }
 
-fn sentence_boundary_at(document: &Document, index: usize) -> Option<usize> {
-    let character = document.char_at(CharPos(index))?;
+/// True when a sentence terminator at `index` ends a sentence, returning the
+/// index just past the terminator and any closing quotes or brackets.
+fn sentence_boundary_at(document: &Document, index: usize, character: char) -> Option<usize> {
     if !matches!(character, '.' | '!' | '?') {
         return None;
     }
     let mut end = index + 1;
-    while end < document.len_chars()
-        && matches!(document.char_at(CharPos(end)), Some(')' | ']' | '"' | '\''))
-    {
-        end += 1;
+    for (at, closing) in document.chars_from(CharPos(end)) {
+        if !matches!(closing, ')' | ']' | '"' | '\'') {
+            break;
+        }
+        end = at.0 + 1;
     }
-    if end == document.len_chars()
-        || document
-            .char_at(CharPos(end))
-            .is_some_and(char::is_whitespace)
-    {
+    let follows_whitespace = document
+        .chars_from(CharPos(end))
+        .next()
+        .is_some_and(|(_, next)| next.is_whitespace());
+    if end == document.len_chars() || follows_whitespace {
         Some(end)
     } else {
         None
@@ -445,11 +446,11 @@ fn enclosing_pair(document: &Document, cursor: CharPos, kind: PairKind) -> Optio
     let position = cursor.0.min(document.len_chars().saturating_sub(1));
     let mut depth = 0usize;
     let mut open = None;
-    for index in (0..=position).rev() {
-        let character = document.char_at(CharPos(index));
-        if character == Some(close_character) && index < position && !is_escaped(document, index) {
+    for (at, character) in document.chars_before(CharPos(position + 1)) {
+        let index = at.0;
+        if character == close_character && index < position && !is_escaped(document, index) {
             depth += 1;
-        } else if character == Some(open_character) && !is_escaped(document, index) {
+        } else if character == open_character && !is_escaped(document, index) {
             if depth == 0 {
                 open = Some(index);
                 break;
@@ -459,11 +460,11 @@ fn enclosing_pair(document: &Document, cursor: CharPos, kind: PairKind) -> Optio
     }
     let open = open?;
     let mut depth = 0usize;
-    for index in open..document.len_chars() {
-        let character = document.char_at(CharPos(index));
-        if character == Some(open_character) && !is_escaped(document, index) {
+    for (at, character) in document.chars_from(CharPos(open)) {
+        let index = at.0;
+        if character == open_character && !is_escaped(document, index) {
             depth += 1;
-        } else if character == Some(close_character) && !is_escaped(document, index) {
+        } else if character == close_character && !is_escaped(document, index) {
             depth = depth.saturating_sub(1);
             if depth == 0 {
                 return Some((open, index));
@@ -480,9 +481,9 @@ fn next_opening_pair(
 ) -> Option<(usize, usize)> {
     let (open_character, close_character) = delimiters(kind);
     let start = cursor.0.min(document.len_chars());
-    for index in start..document.len_chars() {
-        if document.char_at(CharPos(index)) == Some(open_character) && !is_escaped(document, index)
-        {
+    for (at, character) in document.chars_from(CharPos(start)) {
+        let index = at.0;
+        if character == open_character && !is_escaped(document, index) {
             if let Some(close) = matching_close(document, index, open_character, close_character) {
                 return Some((index, close));
             }
@@ -498,11 +499,11 @@ fn matching_close(
     close_character: char,
 ) -> Option<usize> {
     let mut depth = 0usize;
-    for index in open..document.len_chars() {
-        let character = document.char_at(CharPos(index));
-        if character == Some(open_character) && !is_escaped(document, index) {
+    for (at, character) in document.chars_from(CharPos(open)) {
+        let index = at.0;
+        if character == open_character && !is_escaped(document, index) {
             depth += 1;
-        } else if character == Some(close_character) && !is_escaped(document, index) {
+        } else if character == close_character && !is_escaped(document, index) {
             depth = depth.saturating_sub(1);
             if depth == 0 {
                 return Some(index);
@@ -545,7 +546,12 @@ fn is_escaped(document: &Document, index: usize) -> bool {
 }
 
 fn is_blank_line(document: &Document, line: usize) -> bool {
-    document.line_text(line).chars().all(char::is_whitespace)
+    let start = document.line_start(line);
+    let end = document.line_end(line);
+    document
+        .chars_from(start)
+        .take_while(|(position, _)| position.0 < end.0)
+        .all(|(_, character)| character.is_whitespace())
 }
 
 #[derive(Clone)]
@@ -559,21 +565,26 @@ struct Tag {
 
 fn all_tags(document: &Document) -> Vec<Tag> {
     let mut tags = Vec::new();
-    let mut index = 0;
-    while index < document.len_chars() {
-        if document.char_at(CharPos(index)) != Some('<') {
-            index += 1;
+    let mut chars = document.chars_from(CharPos::ZERO);
+    while let Some((index, character)) = chars.next() {
+        if character != '<' {
             continue;
         }
-        let Some(end) = (index + 1..document.len_chars())
-            .find(|candidate| document.char_at(CharPos(*candidate)) == Some('>'))
-        else {
+        // One pass to the closing '>', so a document full of '<' does not
+        // rescan the remainder of the file for every one of them.
+        let mut body = String::new();
+        let mut closed = None;
+        for (position, inner) in chars.by_ref() {
+            if inner == '>' {
+                closed = Some(position);
+                break;
+            }
+            body.push(inner);
+        }
+        let Some(end) = closed else {
             break;
         };
-        let raw: String = (index + 1..end)
-            .filter_map(|position| document.char_at(CharPos(position)))
-            .collect();
-        let trimmed = raw.trim();
+        let trimmed = body.trim();
         if !trimmed.is_empty() {
             let closing = trimmed.starts_with('/');
             let self_closing = trimmed.ends_with('/');
@@ -586,15 +597,14 @@ fn all_tags(document: &Document) -> Vec<Tag> {
                 .to_ascii_lowercase();
             if !name.is_empty() {
                 tags.push(Tag {
-                    start: index,
-                    end,
+                    start: index.0,
+                    end: end.0,
                     name,
                     closing,
                     self_closing,
                 });
             }
         }
-        index = end + 1;
     }
     tags
 }

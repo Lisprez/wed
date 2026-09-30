@@ -155,8 +155,9 @@ fn vertical(document: &Document, cursor: CharPos, count: usize, forward: bool) -
         line: target_line,
         column: current.column,
     });
-    let first_line = current.line.min(document.pos_to_line_col(target).line);
-    let last_line = current.line.max(document.pos_to_line_col(target).line);
+    let target_line = document.pos_to_line_col(target).line;
+    let first_line = current.line.min(target_line);
+    let last_line = current.line.max(target_line);
     let range = CharRange::new(
         document.line_start(first_line),
         document.line_end_with_newline(last_line),
@@ -258,33 +259,61 @@ fn next_word_start(document: &Document, start: usize, big: bool) -> usize {
     if start >= len {
         return len;
     }
-    let mut index = start + 1;
     let current_kind = word_kind(document.char_at(CharPos(start)), big);
+    let mut chars = document.chars_from(CharPos(start + 1)).peekable();
+    // Leave the run the cursor sits in, leaving the first character of the next
+    // run unread so it can be examined again below.
     if current_kind != WordKind::Whitespace {
-        while index < len && word_kind(document.char_at(CharPos(index)), big) == current_kind {
-            index += 1;
+        while chars
+            .peek()
+            .is_some_and(|(_, character)| word_kind(Some(*character), big) == current_kind)
+        {
+            chars.next();
         }
     }
-    while index < len && word_kind(document.char_at(CharPos(index)), big) == WordKind::Whitespace {
-        index += 1;
+    // Then leave the whitespace that separates them.
+    loop {
+        match chars.peek() {
+            Some((_, character)) if word_kind(Some(*character), big) == WordKind::Whitespace => {
+                chars.next();
+            }
+            Some((position, _)) => return position.0,
+            None => return len,
+        }
     }
-    index.min(len)
 }
 
 fn previous_word_start(document: &Document, start: usize, big: bool) -> usize {
-    if start == 0 {
+    let mut chars = document.chars_before(CharPos(start));
+    // `index` tracks the character the iterator is sitting on, so the walk
+    // follows the previous character-at-a-time implementation step for step.
+    let mut index = start;
+    let mut kind = WordKind::Whitespace;
+    while index > 0 {
+        let Some((at, character)) = chars.next() else {
+            return 0;
+        };
+        index = at.0;
+        kind = word_kind(Some(character), big);
+        if kind != WordKind::Whitespace {
+            break;
+        }
+    }
+    if kind == WordKind::Whitespace || index == 0 {
         return 0;
     }
-    let mut index = start.saturating_sub(1);
-    while index > 0 && word_kind(document.char_at(CharPos(index)), big) == WordKind::Whitespace {
-        index -= 1;
-    }
-    if index == 0 {
-        return 0;
-    }
-    let kind = word_kind(document.char_at(CharPos(index)), big);
+    // Walk off the rest of the run. The loop gives up once `index` reaches 0
+    // without examining it, so a run reaching the start of the document reports
+    // 0 even when the character there belongs to the same run.
     index -= 1;
-    while index > 0 && word_kind(document.char_at(CharPos(index)), big) == kind {
+    while index > 0 {
+        let Some((at, character)) = chars.next() else {
+            break;
+        };
+        debug_assert_eq!(at.0, index);
+        if word_kind(Some(character), big) != kind {
+            break;
+        }
         index -= 1;
     }
     index
@@ -292,69 +321,80 @@ fn previous_word_start(document: &Document, start: usize, big: bool) -> usize {
 
 fn next_word_end(document: &Document, start: usize, big: bool) -> usize {
     let len = document.len_chars();
-    let mut index = (start + 1).min(len);
-    while index < len && word_kind(document.char_at(CharPos(index)), big) == WordKind::Whitespace {
-        index += 1;
+    let mut chars = document
+        .chars_from(CharPos((start + 1).min(len)))
+        .peekable();
+    // Leave any leading whitespace, then walk to the end of the run after it.
+    while chars
+        .peek()
+        .is_some_and(|(_, character)| word_kind(Some(*character), big) == WordKind::Whitespace)
+    {
+        chars.next();
     }
-    if index >= len {
+    let Some((first, kind)) = chars
+        .next()
+        .map(|(position, character)| (position, word_kind(Some(character), big)))
+    else {
         return len.saturating_sub(1);
+    };
+    let mut end = first;
+    for (position, character) in chars.by_ref() {
+        if word_kind(Some(character), big) != kind {
+            break;
+        }
+        end = position;
     }
-    let kind = word_kind(document.char_at(CharPos(index)), big);
-    while index + 1 < len && word_kind(document.char_at(CharPos(index + 1)), big) == kind {
-        index += 1;
-    }
-    index
+    end.0
 }
 
 fn next_sentence_end(document: &Document, start: usize) -> usize {
     let len = document.len_chars();
-    let mut index = start;
-    while index < len {
-        let character = document.char_at(CharPos(index));
-        if matches!(character, Some('.' | '!' | '?')) {
-            let mut end = index + 1;
-            while end < len
-                && matches!(document.char_at(CharPos(end)), Some(')' | ']' | '"' | '\''))
-            {
-                end += 1;
-            }
-            if end == len
-                || document
-                    .char_at(CharPos(end))
-                    .is_some_and(char::is_whitespace)
-            {
-                return end;
-            }
+    for (at, character) in document.chars_from(CharPos(start)) {
+        if !matches!(character, '.' | '!' | '?') {
+            continue;
         }
-        index += 1;
+        let mut end = at.0 + 1;
+        for (next, closing) in document.chars_from(CharPos(end)) {
+            if !matches!(closing, ')' | ']' | '"' | '\'') {
+                break;
+            }
+            end = next.0 + 1;
+        }
+        let followed_by_space = document
+            .chars_from(CharPos(end))
+            .next()
+            .is_some_and(|(_, next)| next.is_whitespace());
+        if end == len || followed_by_space {
+            return end;
+        }
     }
     len
 }
 
 fn previous_sentence_start(document: &Document, start: usize) -> usize {
-    if start == 0 {
-        return 0;
-    }
-    let mut index = start;
-    while index > 0 {
-        index -= 1;
-        let character = document.char_at(CharPos(index));
-        if matches!(character, Some('.' | '!' | '?')) {
-            let next = index + 1;
-            if next == document.len_chars()
-                || document
-                    .char_at(CharPos(next))
-                    .is_some_and(char::is_whitespace)
-            {
-                return index + 1;
-            }
+    for (at, character) in document.chars_before(CharPos(start)) {
+        if !matches!(character, '.' | '!' | '?') {
+            continue;
+        }
+        let next = at.0 + 1;
+        let followed_by_space = document
+            .chars_from(CharPos(next))
+            .next()
+            .is_some_and(|(_, after)| after.is_whitespace());
+        if next == document.len_chars() || followed_by_space {
+            return next;
         }
     }
     0
 }
 
 fn is_blank_line(document: &Document, line: usize) -> bool {
-    document.line_text(line).chars().all(char::is_whitespace)
+    let start = document.line_start(line);
+    let end = document.line_end(line);
+    document
+        .chars_from(start)
+        .take_while(|(position, _)| position.0 < end.0)
+        .all(|(_, character)| character.is_whitespace())
 }
 
 fn result(target: CharPos, range: CharRange, kind: RangeKind, inclusive: bool) -> MotionResult {

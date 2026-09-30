@@ -11,7 +11,6 @@ use render::Renderer;
 use std::io::{self, stdout};
 use std::panic;
 use std::path::PathBuf;
-use std::time::Duration;
 
 struct RawModeGuard;
 
@@ -47,24 +46,25 @@ fn main() -> io::Result<()> {
     let mut renderer = Renderer::new()?;
     renderer.render(&app)?;
 
+    // Block until an event arrives rather than polling on a timer: an idle
+    // editor should cost nothing, and terminal resizes still arrive because
+    // crossterm wakes the blocked read on SIGWINCH.
     loop {
-        if event::poll(Duration::from_millis(8))? {
-            match event::read()? {
-                Event::Key(key) => {
-                    if key.kind == KeyEventKind::Release {
-                        continue;
-                    }
-                    if app.handle_key(key)? == AppOutcome::Quit {
-                        break;
-                    }
-                    renderer.render(&app)?;
+        match event::read()? {
+            Event::Key(key) => {
+                if key.kind == KeyEventKind::Release {
+                    continue;
                 }
-                Event::Resize(width, height) => {
-                    renderer.resize(width, height);
-                    renderer.render(&app)?;
+                if app.handle_key(key)? == AppOutcome::Quit {
+                    break;
                 }
-                _ => {}
+                renderer.render(&app)?;
             }
+            Event::Resize(width, height) => {
+                renderer.resize(width, height);
+                renderer.render(&app)?;
+            }
+            _ => {}
         }
     }
 

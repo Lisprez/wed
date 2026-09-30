@@ -298,7 +298,10 @@ impl Editor {
         };
         let range = CharRange::new(CharPos::ZERO, CharPos(self.document.len_chars()));
         self.history.begin();
-        self.apply_edit(range, &replaced);
+        // `original` is exactly what `range` covers, so hand it straight to the
+        // history instead of letting the edit read the whole document back out
+        // of the rope a second time.
+        self.apply_known_edit(range, original, replaced);
         self.history.commit();
         self.cursor = self.cursor.clamp(self.document.len_chars());
         self.selection = None;
@@ -724,15 +727,24 @@ impl Editor {
     }
 
     fn update_visual_target(&mut self, target: CharPos) {
-        let column = self.document.pos_to_line_col(target).column;
-        let anchor_column = self
-            .selection
-            .as_ref()
-            .map(|selection| self.document.pos_to_line_col(selection.anchor).column);
+        // Only a block selection cares about columns, so the other kinds skip
+        // the two line lookups this would otherwise cost on every motion.
+        let block_columns = match self.selection.as_ref() {
+            Some(selection) if matches!(selection.kind, SelectionKind::Blockwise { .. }) => {
+                let column = self.document.pos_to_line_col(target).column;
+                let anchor_column = self
+                    .selection
+                    .as_ref()
+                    .map(|selection| self.document.pos_to_line_col(selection.anchor).column)
+                    .unwrap_or(column);
+                Some((anchor_column, column))
+            }
+            _ => None,
+        };
         if let Some(selection) = &mut self.selection {
             selection.active = target;
             if let SelectionKind::Blockwise { left, right } = &mut selection.kind {
-                let anchor_column = anchor_column.unwrap_or(column);
+                let (anchor_column, column) = block_columns.unwrap_or((0, 0));
                 *left = anchor_column.min(column);
                 *right = anchor_column.max(column) + 1;
             }
@@ -1151,27 +1163,49 @@ impl Editor {
     }
 
     fn apply_edit(&mut self, range: CharRange, inserted: &str) {
-        let start = range.start;
-        let actual_removed = self.document.replace_range(range, inserted);
-        if actual_removed.is_empty() && inserted.is_empty() {
+        let removed = self.document.replace_range(range, inserted);
+        self.record_edit(range, removed, inserted);
+    }
+
+    /// [`Self::apply_edit`] for callers that already hold the text `range`
+    /// covers, so the rope is not read back out just to build the undo record.
+    ///
+    /// Both sides are taken by value: the undo record needs them anyway, so
+    /// there is no reason to copy either one again.
+    fn apply_known_edit(&mut self, range: CharRange, removed: String, inserted: String) {
+        let redundant = removed == inserted || (removed.is_empty() && inserted.is_empty());
+        if redundant {
+            // Swapping text for itself leaves the document as it is, so there is
+            // no reason to rewrite the rope at all.
             return;
         }
-        if actual_removed == inserted {
+        self.document.overwrite_range(range, &inserted);
+        self.history.record(Edit {
+            start: range.start,
+            removed,
+            inserted,
+        });
+        self.revision = self.revision.saturating_add(1);
+    }
+
+    fn record_edit(&mut self, range: CharRange, removed: String, inserted: &str) {
+        if removed.is_empty() && inserted.is_empty() {
+            return;
+        }
+        if removed == inserted {
             return;
         }
         self.history.record(Edit {
-            start,
-            removed: actual_removed,
+            start: range.start,
+            removed,
             inserted: inserted.to_string(),
         });
         self.revision = self.revision.saturating_add(1);
     }
 
     fn undo(&mut self) {
-        if let Some(transaction) = self.history.undo(&mut self.document) {
-            if let Some(edit) = transaction.edits.first() {
-                self.cursor = edit.start;
-            }
+        if let Some(cursor) = self.history.undo(&mut self.document) {
+            self.cursor = cursor;
             self.revision = self.revision.saturating_add(1);
             self.mode = Mode::Normal;
             self.selection = None;
@@ -1179,10 +1213,8 @@ impl Editor {
     }
 
     fn redo(&mut self) {
-        if let Some(transaction) = self.history.redo(&mut self.document) {
-            if let Some(edit) = transaction.edits.last() {
-                self.cursor = edit.start.advance(edit.inserted.chars().count());
-            }
+        if let Some(cursor) = self.history.redo(&mut self.document) {
+            self.cursor = cursor;
             self.revision = self.revision.saturating_add(1);
             self.mode = Mode::Normal;
             self.selection = None;
@@ -1435,43 +1467,100 @@ fn register_kind(kind: RangeKind) -> RegisterKind {
     }
 }
 
+/// Characters pulled from the rope per chunk while searching. Large enough that
+/// the substring search does the matching, small enough to stay cache resident.
+const SEARCH_CHUNK: usize = 1 << 16;
+
 fn find_search(
     document: &Document,
     cursor: CharPos,
     query: &str,
     backwards: bool,
 ) -> Option<CharPos> {
-    let needle: Vec<char> = query.chars().collect();
-    if needle.is_empty() || needle.len() > document.len_chars() {
+    let needle = query.chars().count();
+    let len = document.len_chars();
+    if needle == 0 || needle > len {
         return None;
     }
-    let len = document.len_chars();
     if backwards {
         if cursor.0 == 0 {
             return None;
         }
-        let mut start = cursor.0.min(len);
-        while start > 0 {
-            start -= 1;
-            if start + needle.len() <= len
-                && (0..needle.len())
-                    .all(|offset| document.char_at(CharPos(start + offset)) == Some(needle[offset]))
-            {
-                return Some(CharPos(start));
-            }
-        }
+        let limit = cursor.0.min(len);
+        find_last_match(document, query, limit)
     } else {
-        let mut start = cursor.0.saturating_add(1);
-        while start + needle.len() <= len {
-            if (0..needle.len())
-                .all(|offset| document.char_at(CharPos(start + offset)) == Some(needle[offset]))
-            {
-                return Some(CharPos(start));
-            }
-            start += 1;
+        let from = cursor.0.saturating_add(1);
+        if from + needle > len {
+            return None;
         }
+        find_first_match(document, query, from)
+    }
+}
+
+/// Start of the first occurrence of `query` at or after `from`.
+///
+/// The document is examined one overlapping chunk at a time and matched with the
+/// standard library's substring search, so the cost is driven by the document
+/// size rather than by one rope lookup per candidate position.
+fn find_first_match(document: &Document, query: &str, from: usize) -> Option<CharPos> {
+    let len = document.len_chars();
+    let needle = query.chars().count();
+    let mut buffer = String::with_capacity(SEARCH_CHUNK + needle);
+    let mut chunk = 0usize;
+    while chunk < len {
+        // Overlap by the needle so matches spanning a boundary stay visible.
+        let end = (chunk + SEARCH_CHUNK + needle - 1).min(len);
+        buffer.clear();
+        document.write_slice(CharRange::new(CharPos(chunk), CharPos(end)), &mut buffer);
+        let earliest = from.max(chunk);
+        let start_byte = if earliest > chunk {
+            buffer
+                .chars()
+                .take(earliest - chunk)
+                .map(char::len_utf8)
+                .sum()
+        } else {
+            0
+        };
+        if let Some(found) = buffer[start_byte..].find(query) {
+            let at = start_byte + found;
+            return Some(CharPos(chunk + buffer[..at].chars().count()));
+        }
+        chunk += SEARCH_CHUNK;
     }
     None
+}
+
+/// Start of the last occurrence of `query` strictly before `limit`.
+///
+/// A match may begin before `limit` and still extend past it, so candidates are
+/// rejected on their start position rather than on where the needle ends.
+fn find_last_match(document: &Document, query: &str, limit: usize) -> Option<CharPos> {
+    let len = document.len_chars();
+    let needle = query.chars().count();
+    let mut buffer = String::with_capacity(SEARCH_CHUNK + needle);
+    let mut chunk = (limit - 1) / SEARCH_CHUNK * SEARCH_CHUNK;
+    loop {
+        let end = (chunk + SEARCH_CHUNK + needle - 1).min(len);
+        buffer.clear();
+        document.write_slice(CharRange::new(CharPos(chunk), CharPos(end)), &mut buffer);
+        let mut searchable = buffer.len();
+        while searchable > 0 {
+            let Some(found) = buffer[..searchable].rfind(query) else {
+                break;
+            };
+            let start = chunk + buffer[..found].chars().count();
+            if start < limit {
+                return Some(CharPos(start));
+            }
+            // Keep the matches that begin earlier.
+            searchable = found;
+        }
+        if chunk == 0 {
+            return None;
+        }
+        chunk -= SEARCH_CHUNK;
+    }
 }
 
 fn find_target(
@@ -1494,18 +1583,20 @@ fn find_target(
                 index = index.saturating_add(1);
             }
             let mut found = 0;
-            while index < line_end.0 {
-                if document.char_at(CharPos(index)) == Some(character) {
+            for (position, candidate) in document
+                .chars_from(CharPos(index))
+                .take_while(|(p, _)| p.0 < line_end.0)
+            {
+                if candidate == character {
                     found += 1;
                     if found == count {
                         return Some(if is_till_find_kind(kind) {
-                            CharPos(index - 1)
+                            CharPos(position.0 - 1)
                         } else {
-                            CharPos(index)
+                            position
                         });
                     }
                 }
-                index += 1;
             }
             None
         }
@@ -1517,25 +1608,31 @@ fn find_target(
             if skip_adjacent && index > line_start.0 {
                 index -= 1;
             }
+            // Walking backwards one character at a time is what the rope is slow
+            // at, so read the span once and scan it in reverse instead.
+            let mut span = String::new();
+            document.write_slice(
+                CharRange::new(CharPos(line_start.0), CharPos(index + 1)),
+                &mut span,
+            );
             let mut found = 0;
-            loop {
-                if document.char_at(CharPos(index)) == Some(character) {
+            let mut offset = index + 1 - line_start.0;
+            for candidate in span.chars().rev() {
+                offset -= 1;
+                let at = line_start.0 + offset;
+                if candidate == character {
                     found += 1;
                     if found == count {
                         if !is_till_find_kind(kind) {
-                            return Some(CharPos(index));
+                            return Some(CharPos(at));
                         }
-                        let landing = index + 1;
+                        let landing = at + 1;
                         if landing >= line_end.0 {
                             return None;
                         }
                         return Some(CharPos(landing));
                     }
                 }
-                if index == line_start.0 {
-                    break;
-                }
-                index -= 1;
             }
             None
         }
