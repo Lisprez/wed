@@ -241,6 +241,10 @@ impl Editor {
         self.pending_clipboard_text.take()
     }
 
+    pub fn is_waiting_for_character(&self) -> bool {
+        self.find_pending.is_some() || self.replace_pending || self.g_pending
+    }
+
     pub fn search_prompt(&self) -> Option<String> {
         (self.mode == Mode::Search).then(|| {
             format!(
@@ -311,6 +315,9 @@ impl Editor {
     }
 
     fn handle_normal_key(&mut self, key: Key) -> EditorOutcome {
+        if self.handle_pending_find(key) {
+            return EditorOutcome::Continue;
+        }
         if self.replace_pending {
             if let Key::Char(character) = key {
                 self.replace_pending = false;
@@ -355,13 +362,8 @@ impl Editor {
             Key::Char('g') => self.g_pending = true,
             Key::Char('G') => {
                 let count = self.take_count();
-                if count == 1 {
-                    self.move_with(Motion::GotoLast, 1);
-                } else {
-                    let line = count.saturating_sub(1);
-                    self.cursor = self.document.line_start(line);
-                    self.selection = None;
-                }
+                self.cursor = self.goto_line_target(count);
+                self.selection = None;
             }
             Key::Char('x') => self.delete_current(),
             Key::Char('X') => self.delete_before(),
@@ -375,32 +377,18 @@ impl Editor {
             Key::Char('?') => self.begin_search(true),
             Key::Char('n') => self.repeat_search(false),
             Key::Char('N') => self.repeat_search(true),
-            Key::Char('f') => {
-                self.find_pending = Some(FindState {
-                    kind: FindKind::Forward,
-                    count: self.take_count(),
-                })
+            Key::Char('f') => self.begin_find(FindKind::Forward),
+            Key::Char('F') => self.begin_find(FindKind::Backward),
+            Key::Char('t') => self.begin_find(FindKind::TillForward),
+            Key::Char('T') => self.begin_find(FindKind::TillBackward),
+            Key::Char(';') => {
+                let count = self.take_count();
+                self.repeat_find(false, count);
             }
-            Key::Char('F') => {
-                self.find_pending = Some(FindState {
-                    kind: FindKind::Backward,
-                    count: self.take_count(),
-                })
+            Key::Char(',') => {
+                let count = self.take_count();
+                self.repeat_find(true, count);
             }
-            Key::Char('t') => {
-                self.find_pending = Some(FindState {
-                    kind: FindKind::TillForward,
-                    count: self.take_count(),
-                })
-            }
-            Key::Char('T') => {
-                self.find_pending = Some(FindState {
-                    kind: FindKind::TillBackward,
-                    count: self.take_count(),
-                })
-            }
-            Key::Char(';') => self.repeat_find(false),
-            Key::Char(',') => self.repeat_find(true),
             Key::Left => self.move_with(Motion::Left, 1),
             Key::Right => self.move_with(Motion::Right, 1),
             Key::Up => self.move_with(Motion::Up, 1),
@@ -494,6 +482,14 @@ impl Editor {
     }
 
     fn handle_visual_key(&mut self, key: Key) -> EditorOutcome {
+        if self.handle_pending_find(key) {
+            return EditorOutcome::Continue;
+        }
+        if let Key::Char(character) = key {
+            if self.accumulate_normal_digit(character) {
+                return EditorOutcome::Continue;
+            }
+        }
         if let Some(prefix) = self.visual_prefix {
             if let Key::Char(character) = key {
                 self.visual_prefix = None;
@@ -507,10 +503,7 @@ impl Editor {
             }
         }
         match key {
-            Key::Escape => {
-                self.mode = Mode::Normal;
-                self.selection = None;
-            }
+            Key::Escape => self.reset_pending(),
             Key::Char('v') => {
                 self.selection = self.selection.as_ref().map(|selection| Selection {
                     kind: SelectionKind::Characterwise,
@@ -531,11 +524,29 @@ impl Editor {
             Key::Char('o') => {
                 if let Some(selection) = &mut self.selection {
                     std::mem::swap(&mut selection.anchor, &mut selection.active);
+                    self.cursor = selection.active;
                 }
             }
             Key::Char('d') => self.apply_visual_operator(Operator::Delete),
             Key::Char('c') => self.apply_visual_operator(Operator::Change),
             Key::Char('y') => self.apply_visual_operator(Operator::Yank),
+            Key::Char('G') => {
+                let count = self.take_count();
+                let target = self.goto_line_target(count);
+                self.update_visual_target(target);
+            }
+            Key::Char('f') => self.begin_find(FindKind::Forward),
+            Key::Char('F') => self.begin_find(FindKind::Backward),
+            Key::Char('t') => self.begin_find(FindKind::TillForward),
+            Key::Char('T') => self.begin_find(FindKind::TillBackward),
+            Key::Char(';') => {
+                let count = self.take_count();
+                self.repeat_find(false, count);
+            }
+            Key::Char(',') => {
+                let count = self.take_count();
+                self.repeat_find(true, count);
+            }
             Key::Left => self.update_visual(Motion::Left),
             Key::Right => self.update_visual(Motion::Right),
             Key::Up => self.update_visual(Motion::Up),
@@ -558,6 +569,9 @@ impl Editor {
     }
 
     fn handle_pending_key(&mut self, key: Key) -> EditorOutcome {
+        if self.handle_pending_find(key) {
+            return EditorOutcome::Continue;
+        }
         let Some(mut pending) = self.pending else {
             self.mode = Mode::Normal;
             return EditorOutcome::Continue;
@@ -601,6 +615,20 @@ impl Editor {
                 }
                 self.pending = None;
                 self.mode = Mode::Normal;
+                return EditorOutcome::Continue;
+            }
+            if let Some(kind) = find_kind_for_key(character) {
+                let count = pending
+                    .count
+                    .saturating_mul(pending.motion_count.unwrap_or(1));
+                self.begin_find_with_count(kind, count);
+                return EditorOutcome::Continue;
+            }
+            if character == ';' || character == ',' {
+                let count = pending
+                    .count
+                    .saturating_mul(pending.motion_count.unwrap_or(1));
+                self.repeat_find(character == ',', count);
                 return EditorOutcome::Continue;
             }
             if operator_for_key(character) == Some(pending.operator) {
@@ -668,10 +696,6 @@ impl Editor {
         if let Some(motion) = motion {
             let count = self.take_count();
             self.move_with(motion, count);
-        } else if let Key::Char(character) = key {
-            if let Some(state) = self.find_pending.take() {
-                self.resolve_find(state, character);
-            }
         }
     }
 
@@ -681,20 +705,51 @@ impl Editor {
         self.selection = None;
     }
 
+    fn goto_line_target(&self, count: usize) -> CharPos {
+        let line = if count <= 1 {
+            self.document.line_count().saturating_sub(1)
+        } else {
+            count - 1
+        };
+        self.document.line_start(line)
+    }
+
     fn update_visual(&mut self, motion: Motion) {
         let count = self.take_count();
         let Some(active) = self.selection.as_ref().map(|selection| selection.active) else {
             return;
         };
         let result = motion::resolve(&self.document, active, motion, count);
-        let column = self.document.pos_to_line_col(result.target).column;
+        self.update_visual_target(result.target);
+    }
+
+    fn update_visual_target(&mut self, target: CharPos) {
+        let column = self.document.pos_to_line_col(target).column;
+        let anchor_column = self
+            .selection
+            .as_ref()
+            .map(|selection| self.document.pos_to_line_col(selection.anchor).column);
         if let Some(selection) = &mut self.selection {
-            selection.active = result.target;
+            selection.active = target;
             if let SelectionKind::Blockwise { left, right } = &mut selection.kind {
-                *left = (*left).min(column);
-                *right = (*right).max(column + 1);
+                let anchor_column = anchor_column.unwrap_or(column);
+                *left = anchor_column.min(column);
+                *right = anchor_column.max(column) + 1;
             }
         }
+        self.cursor = target;
+    }
+
+    fn begin_find(&mut self, kind: FindKind) {
+        let count = self.take_count();
+        self.begin_find_with_count(kind, count);
+    }
+
+    fn begin_find_with_count(&mut self, kind: FindKind, count: usize) {
+        self.find_pending = Some(FindState {
+            kind,
+            count: count.max(1),
+        });
     }
 
     fn start_operator(&mut self, operator: Operator) {
@@ -942,11 +997,13 @@ impl Editor {
         let text_len = text.chars().count();
         match operator {
             Operator::Yank => {
-                self.unnamed_register = Some(RegisterValue {
-                    text,
-                    kind: register_kind(kind),
-                });
-                self.message = format!("Yanked {} characters", text_len);
+                if !range.is_empty() {
+                    self.unnamed_register = Some(RegisterValue {
+                        text,
+                        kind: register_kind(kind),
+                    });
+                    self.message = format!("Yanked {} characters", text_len);
+                }
                 self.mode = Mode::Normal;
                 self.selection = None;
             }
@@ -976,6 +1033,8 @@ impl Editor {
         };
         let ranges = selection.ranges(&self.document);
         if ranges.is_empty() {
+            self.normal_count = None;
+            self.visual_prefix = None;
             self.mode = Mode::Normal;
             self.selection = None;
             return;
@@ -1033,6 +1092,8 @@ impl Editor {
                 self.selection = None;
             }
         }
+        self.normal_count = None;
+        self.visual_prefix = None;
     }
 
     fn extend_visual_object(&mut self, object: TextObject, count: usize) {
@@ -1053,6 +1114,7 @@ impl Editor {
             selection.anchor = selection.anchor.min(range.start);
             selection.active = selection.active.max(CharPos(range.end.0.saturating_sub(1)));
         }
+        self.cursor = selection.active;
         let kind = selection.kind;
         self.mode = Mode::Visual(kind);
     }
@@ -1127,35 +1189,111 @@ impl Editor {
         }
     }
 
+    fn handle_pending_find(&mut self, key: Key) -> bool {
+        let Some(state) = self.find_pending.take() else {
+            return false;
+        };
+        match key {
+            Key::Char(character) => self.resolve_find(state, character),
+            Key::Escape => self.reset_pending(),
+            _ => self.cancel_pending_find(),
+        }
+        true
+    }
+
     fn resolve_find(&mut self, state: FindState, character: char) {
         self.last_find = Some((state.kind, character));
+        let origin = self
+            .selection
+            .as_ref()
+            .map(|selection| selection.active)
+            .unwrap_or(self.cursor);
         let target = find_target(
             &self.document,
-            self.cursor,
+            origin,
             state.kind,
             character,
             state.count,
+            false,
         );
-        if let Some(target) = target {
-            self.cursor = target;
+        self.apply_find_target(target, state.kind, state.count);
+    }
+
+    fn apply_find_target(&mut self, target: Option<CharPos>, kind: FindKind, count: usize) {
+        match self.mode {
+            Mode::Normal => {
+                if let Some(target) = target {
+                    self.cursor = target;
+                    self.message.clear();
+                } else {
+                    self.message = "Character not found".to_string();
+                }
+            }
+            Mode::Visual(_) => {
+                if let Some(target) = target {
+                    self.update_visual_target(target);
+                    self.message.clear();
+                } else {
+                    self.message = "Character not found".to_string();
+                }
+            }
+            Mode::OperatorPending(_) => {
+                let Some(pending) = self.pending.take() else {
+                    self.mode = Mode::Normal;
+                    return;
+                };
+                if let Some(target) = target {
+                    let range = find_operator_range(&self.document, self.cursor, target, kind);
+                    self.apply_operator_range(
+                        pending.operator,
+                        range,
+                        RangeKind::Characterwise,
+                        count,
+                    );
+                } else {
+                    self.normal_count = None;
+                    self.mode = Mode::Normal;
+                    self.message = "Character not found".to_string();
+                }
+            }
+            Mode::Insert | Mode::Search | Mode::CommandLine => self.reset_pending(),
         }
     }
 
-    fn repeat_find(&mut self, reverse: bool) {
+    fn repeat_find(&mut self, reverse: bool, count: usize) {
         let Some((kind, character)) = self.last_find else {
+            self.message = "No previous character search".to_string();
+            self.cancel_pending_find();
             return;
         };
         let kind = if reverse {
-            match kind {
-                FindKind::Forward => FindKind::Backward,
-                FindKind::Backward => FindKind::Forward,
-                FindKind::TillForward => FindKind::TillBackward,
-                FindKind::TillBackward => FindKind::TillForward,
-            }
+            reverse_find_kind(kind)
         } else {
             kind
         };
-        self.resolve_find(FindState { kind, count: 1 }, character);
+        let skip_adjacent = count == 1 && is_till_find_kind(kind);
+        let origin = self
+            .selection
+            .as_ref()
+            .map(|selection| selection.active)
+            .unwrap_or(self.cursor);
+        let target = find_target(
+            &self.document,
+            origin,
+            kind,
+            character,
+            count,
+            skip_adjacent,
+        );
+        self.apply_find_target(target, kind, count);
+    }
+
+    fn cancel_pending_find(&mut self) {
+        self.normal_count = None;
+        if matches!(self.mode, Mode::OperatorPending(_)) {
+            self.pending = None;
+            self.mode = Mode::Normal;
+        }
     }
 
     fn accumulate_normal_digit(&mut self, character: char) -> bool {
@@ -1179,6 +1317,7 @@ impl Editor {
     fn reset_pending(&mut self) {
         self.normal_count = None;
         self.pending = None;
+        self.visual_prefix = None;
         self.find_pending = None;
         self.g_pending = false;
         self.search_input.clear();
@@ -1251,6 +1390,43 @@ fn motion_for_key(character: char) -> Option<Motion> {
     }
 }
 
+fn find_kind_for_key(character: char) -> Option<FindKind> {
+    match character {
+        'f' => Some(FindKind::Forward),
+        'F' => Some(FindKind::Backward),
+        't' => Some(FindKind::TillForward),
+        'T' => Some(FindKind::TillBackward),
+        _ => None,
+    }
+}
+
+fn is_till_find_kind(kind: FindKind) -> bool {
+    matches!(kind, FindKind::TillForward | FindKind::TillBackward)
+}
+
+fn reverse_find_kind(kind: FindKind) -> FindKind {
+    match kind {
+        FindKind::Forward => FindKind::Backward,
+        FindKind::Backward => FindKind::Forward,
+        FindKind::TillForward => FindKind::TillBackward,
+        FindKind::TillBackward => FindKind::TillForward,
+    }
+}
+
+fn find_operator_range(
+    document: &Document,
+    cursor: CharPos,
+    target: CharPos,
+    kind: FindKind,
+) -> CharRange {
+    match kind {
+        FindKind::Forward | FindKind::TillForward => {
+            CharRange::new(cursor, target.advance(1).clamp(document.len_chars()))
+        }
+        FindKind::Backward | FindKind::TillBackward => CharRange::new(target, cursor),
+    }
+}
+
 fn register_kind(kind: RangeKind) -> RegisterKind {
     match kind {
         RangeKind::Characterwise => RegisterKind::Characterwise,
@@ -1304,24 +1480,29 @@ fn find_target(
     kind: FindKind,
     character: char,
     count: usize,
+    skip_adjacent: bool,
 ) -> Option<CharPos> {
-    let len = document.len_chars();
+    let line = document.pos_to_line_col(cursor).line;
+    let line_start = document.line_start(line);
+    let line_end = document.line_end(line);
+    let cursor = CharPos(cursor.0.clamp(line_start.0, line_end.0));
     let count = count.max(1);
     match kind {
         FindKind::Forward | FindKind::TillForward => {
             let mut index = cursor.0.saturating_add(1);
+            if skip_adjacent {
+                index = index.saturating_add(1);
+            }
             let mut found = 0;
-            while index < len {
+            while index < line_end.0 {
                 if document.char_at(CharPos(index)) == Some(character) {
                     found += 1;
                     if found == count {
-                        return Some(
-                            if matches!(kind, FindKind::TillForward) && index > cursor.0 {
-                                CharPos(index - 1)
-                            } else {
-                                CharPos(index)
-                            },
-                        );
+                        return Some(if is_till_find_kind(kind) {
+                            CharPos(index - 1)
+                        } else {
+                            CharPos(index)
+                        });
                     }
                 }
                 index += 1;
@@ -1329,25 +1510,29 @@ fn find_target(
             None
         }
         FindKind::Backward | FindKind::TillBackward => {
-            if cursor.0 == 0 {
+            if cursor.0 <= line_start.0 {
                 return None;
             }
             let mut index = cursor.0 - 1;
+            if skip_adjacent && index > line_start.0 {
+                index -= 1;
+            }
             let mut found = 0;
             loop {
                 if document.char_at(CharPos(index)) == Some(character) {
                     found += 1;
                     if found == count {
-                        return Some(
-                            if matches!(kind, FindKind::TillBackward) && index + 1 < len {
-                                CharPos(index + 1)
-                            } else {
-                                CharPos(index)
-                            },
-                        );
+                        if !is_till_find_kind(kind) {
+                            return Some(CharPos(index));
+                        }
+                        let landing = index + 1;
+                        if landing >= line_end.0 {
+                            return None;
+                        }
+                        return Some(CharPos(landing));
                     }
                 }
-                if index == 0 {
+                if index == line_start.0 {
                     break;
                 }
                 index -= 1;
@@ -1629,6 +1814,306 @@ mod tests {
             &[Key::Char('v'), Key::Char('%'), Key::Char('d')],
         );
         assert_eq!(editor.text(), "");
+    }
+
+    #[test]
+    fn supports_forward_and_backward_character_find() {
+        let mut editor = Editor::from_text("ba");
+        keys(&mut editor, &[Key::Char('f'), Key::Char('a')]);
+        assert_eq!(editor.cursor, CharPos(1));
+        assert_eq!(editor.mode, Mode::Normal);
+
+        let mut editor = Editor::from_text("a-b-c");
+        keys(
+            &mut editor,
+            &[Key::Char('2'), Key::Char('f'), Key::Char('-')],
+        );
+        assert_eq!(editor.cursor, CharPos(3));
+
+        let mut editor = Editor::from_text("a-b-c");
+        editor.cursor = CharPos(4);
+        keys(
+            &mut editor,
+            &[Key::Char('2'), Key::Char('F'), Key::Char('-')],
+        );
+        assert_eq!(editor.cursor, CharPos(1));
+
+        let mut editor = Editor::from_text("a1a");
+        keys(&mut editor, &[Key::Char('f'), Key::Char('1')]);
+        assert_eq!(editor.cursor, CharPos(1));
+
+        let mut editor = Editor::from_text("a f f");
+        keys(&mut editor, &[Key::Char('f'), Key::Char('f')]);
+        assert_eq!(editor.cursor, CharPos(2));
+    }
+
+    #[test]
+    fn character_find_does_not_cross_lines() {
+        let mut editor = Editor::from_text("ab\nx");
+        keys(&mut editor, &[Key::Char('f'), Key::Char('x')]);
+        assert_eq!(editor.cursor, CharPos(0));
+        assert_eq!(editor.message, "Character not found");
+
+        let mut editor = Editor::from_text("x\nab");
+        editor.cursor = CharPos(3);
+        keys(&mut editor, &[Key::Char('F'), Key::Char('x')]);
+        assert_eq!(editor.cursor, CharPos(3));
+        assert_eq!(editor.message, "Character not found");
+    }
+
+    #[test]
+    fn repeats_character_find_with_direction_and_count() {
+        let mut editor = Editor::from_text("a-a-a-a");
+        keys(&mut editor, &[Key::Char('f'), Key::Char('a')]);
+        assert_eq!(editor.cursor, CharPos(2));
+        keys(&mut editor, &[Key::Char('2'), Key::Char(';')]);
+        assert_eq!(editor.cursor, CharPos(6));
+        keys(&mut editor, &[Key::Char(',')]);
+        assert_eq!(editor.cursor, CharPos(4));
+        keys(&mut editor, &[Key::Char(';')]);
+        assert_eq!(editor.cursor, CharPos(6));
+        keys(&mut editor, &[Key::Char(',')]);
+        assert_eq!(editor.cursor, CharPos(4));
+
+        let mut editor = Editor::from_text("abcabcabcabc");
+        keys(&mut editor, &[Key::Char('f'), Key::Char('a')]);
+        keys(&mut editor, &[Key::Char('2'), Key::Char(';')]);
+        keys(&mut editor, &[Key::Char('l')]);
+        assert_eq!(editor.cursor, CharPos(10));
+
+        let mut editor = Editor::from_text("aaba");
+        keys(&mut editor, &[Key::Char('t'), Key::Char('a')]);
+        assert_eq!(editor.cursor, CharPos(0));
+        keys(&mut editor, &[Key::Char(';')]);
+        assert_eq!(editor.cursor, CharPos(2));
+    }
+
+    #[test]
+    fn supports_character_find_operators() {
+        let mut editor = Editor::from_text("abca");
+        keys(
+            &mut editor,
+            &[Key::Char('d'), Key::Char('f'), Key::Char('a')],
+        );
+        assert_eq!(editor.text(), "");
+
+        let mut editor = Editor::from_text("abca");
+        keys(
+            &mut editor,
+            &[Key::Char('d'), Key::Char('t'), Key::Char('a')],
+        );
+        assert_eq!(editor.text(), "a");
+
+        let mut editor = Editor::from_text("abca");
+        editor.cursor = CharPos(3);
+        keys(
+            &mut editor,
+            &[Key::Char('d'), Key::Char('F'), Key::Char('a')],
+        );
+        assert_eq!(editor.text(), "a");
+
+        let mut editor = Editor::from_text("abca");
+        editor.cursor = CharPos(3);
+        keys(
+            &mut editor,
+            &[Key::Char('d'), Key::Char('T'), Key::Char('a')],
+        );
+        assert_eq!(editor.text(), "aa");
+
+        let mut editor = Editor::from_text("abcde");
+        editor.cursor = CharPos(4);
+        keys(
+            &mut editor,
+            &[Key::Char('d'), Key::Char('F'), Key::Char('b')],
+        );
+        assert_eq!(editor.text(), "ae");
+
+        let mut editor = Editor::from_text("abcde");
+        editor.cursor = CharPos(4);
+        keys(
+            &mut editor,
+            &[Key::Char('d'), Key::Char('T'), Key::Char('b')],
+        );
+        assert_eq!(editor.text(), "abe");
+
+        let mut editor = Editor::from_text("a--c");
+        editor.cursor = CharPos(3);
+        keys(
+            &mut editor,
+            &[Key::Char('d'), Key::Char('T'), Key::Char('-')],
+        );
+        assert_eq!(editor.text(), "a--c");
+
+        let mut editor = Editor::from_text("a--c");
+        editor.cursor = CharPos(3);
+        keys(
+            &mut editor,
+            &[Key::Char('c'), Key::Char('T'), Key::Char('-')],
+        );
+        assert_eq!(editor.text(), "a--c");
+        assert_eq!(editor.mode, Mode::Insert);
+
+        let mut editor = Editor::from_text("abc");
+        editor.cursor = CharPos(3);
+        keys(&mut editor, &[Key::Char('T'), Key::Char('c')]);
+        assert_eq!(editor.cursor, CharPos(3));
+        assert_eq!(editor.message, "Character not found");
+
+        let mut editor = Editor::from_text("abababa");
+        keys(&mut editor, &[Key::Char('f'), Key::Char('a')]);
+        keys(&mut editor, &[Key::Char('d'), Key::Char(';')]);
+        assert_eq!(editor.text(), "abba");
+
+        let mut editor = Editor::from_text("abacada");
+        editor.cursor = CharPos(6);
+        keys(
+            &mut editor,
+            &[
+                Key::Char('d'),
+                Key::Char('2'),
+                Key::Char('F'),
+                Key::Char('a'),
+            ],
+        );
+        assert_eq!(editor.text(), "aba");
+
+        let mut editor = Editor::from_text("abc");
+        keys(
+            &mut editor,
+            &[Key::Char('d'), Key::Char('f'), Key::Char('z')],
+        );
+        assert_eq!(editor.text(), "abc");
+        assert_eq!(editor.mode, Mode::Normal);
+        assert_eq!(editor.message, "Character not found");
+    }
+
+    #[test]
+    fn supports_character_find_in_visual_mode() {
+        let mut editor = Editor::from_text("a-b-c-d");
+        keys(
+            &mut editor,
+            &[
+                Key::Char('v'),
+                Key::Char('2'),
+                Key::Char('f'),
+                Key::Char('-'),
+            ],
+        );
+        let selection = editor.selection.as_ref().unwrap();
+        assert_eq!(
+            editor.document.slice(selection.ranges(&editor.document)[0]),
+            "a-b-"
+        );
+        keys(&mut editor, &[Key::Char(';')]);
+        let selection = editor.selection.as_ref().unwrap();
+        assert_eq!(
+            editor.document.slice(selection.ranges(&editor.document)[0]),
+            "a-b-c-"
+        );
+
+        let mut editor = Editor::from_text("ba");
+        keys(
+            &mut editor,
+            &[Key::Char('v'), Key::Char('f'), Key::Char('a')],
+        );
+        let selection = editor.selection.as_ref().unwrap();
+        assert_eq!(
+            editor.document.slice(selection.ranges(&editor.document)[0]),
+            "ba"
+        );
+    }
+
+    #[test]
+    fn visual_character_find_updates_block_boundaries() {
+        let mut editor = Editor::from_text("abcdefghij");
+        editor.cursor = CharPos(3);
+        keys(
+            &mut editor,
+            &[
+                Key::Ctrl('v'),
+                Key::Char('f'),
+                Key::Char('f'),
+                Key::Char('F'),
+                Key::Char('e'),
+            ],
+        );
+        let selection = editor.selection.as_ref().unwrap();
+        assert_eq!(
+            editor.document.slice(selection.ranges(&editor.document)[0]),
+            "de"
+        );
+    }
+
+    #[test]
+    fn visual_count_does_not_leak_into_normal_mode() {
+        let mut editor = Editor::from_text("a0z0z");
+        keys(&mut editor, &[Key::Char('v'), Key::Char('2'), Key::Escape]);
+        keys(&mut editor, &[Key::Char('f'), Key::Char('z')]);
+        assert_eq!(editor.cursor, CharPos(2));
+
+        let mut editor = Editor::from_text("abc\ndef\nghi");
+        keys(
+            &mut editor,
+            &[Key::Char('v'), Key::Char('2'), Key::Char('d')],
+        );
+        keys(&mut editor, &[Key::Char('G')]);
+        assert_eq!(editor.cursor, CharPos(7));
+    }
+
+    #[test]
+    fn visual_goto_last_extends_selection_to_end_of_file() {
+        let mut editor = Editor::from_text("one\ntwo\nthree");
+        keys(&mut editor, &[Key::Char('v'), Key::Char('G')]);
+        assert_eq!(
+            editor.mode,
+            Mode::Visual(crate::core::SelectionKind::Characterwise)
+        );
+        assert_eq!(editor.cursor, CharPos(8));
+        let selection = editor.selection.clone().unwrap();
+        assert_eq!(selection.active, CharPos(8));
+        assert_eq!(
+            editor.document.slice(selection.ranges(&editor.document)[0]),
+            "one\ntwo\nt"
+        );
+
+        keys(&mut editor, &[Key::Char('y')]);
+        assert_eq!(editor.take_clipboard_text().as_deref(), Some("one\ntwo\nt"));
+    }
+
+    #[test]
+    fn visual_goto_last_with_count_jumps_to_that_line() {
+        let mut editor = Editor::from_text("one\ntwo\nthree");
+        editor.cursor = CharPos(4);
+        keys(
+            &mut editor,
+            &[Key::Char('V'), Key::Char('3'), Key::Char('G')],
+        );
+        assert_eq!(editor.cursor, CharPos(8));
+        keys(&mut editor, &[Key::Char('y')]);
+        assert_eq!(editor.take_clipboard_text().as_deref(), Some("two\nthree"));
+    }
+
+    #[test]
+    fn visual_motion_syncs_cursor_with_selection_active() {
+        let mut editor = Editor::from_text("one\ntwo\nthree");
+        keys(
+            &mut editor,
+            &[Key::Char('v'), Key::Char('j'), Key::Char('j')],
+        );
+        assert_eq!(editor.cursor, CharPos(8));
+        keys(&mut editor, &[Key::Char('o')]);
+        assert_eq!(editor.cursor, CharPos(0));
+        assert_eq!(editor.selection.as_ref().unwrap().active, CharPos(0));
+    }
+
+    #[test]
+    fn visual_text_object_syncs_cursor_with_selection_active() {
+        let mut editor = Editor::from_text("alpha beta");
+        keys(
+            &mut editor,
+            &[Key::Char('v'), Key::Char('i'), Key::Char('w')],
+        );
+        assert_eq!(editor.cursor, CharPos(4));
     }
 
     #[test]

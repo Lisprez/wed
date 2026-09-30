@@ -89,7 +89,10 @@ impl App {
                 _ => {}
             }
         }
-        if key.code == KeyCode::Char(':') && self.editor.mode == wed::core::Mode::Normal {
+        if key.code == KeyCode::Char(':')
+            && self.editor.mode == wed::core::Mode::Normal
+            && !self.editor.is_waiting_for_character()
+        {
             self.mode = AppMode::CommandLine;
             self.command_input.clear();
             return Ok(AppOutcome::Continue);
@@ -372,6 +375,30 @@ mod tests {
                 .slice(selection.ranges(&app.editor.document)[0]),
             "one "
         );
+    }
+
+    #[test]
+    fn routes_replace_target_before_command_line() {
+        let mut app = App::new(None).unwrap();
+        app.editor.replace_text("abc");
+        for character in "r:".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE))
+                .unwrap();
+        }
+        assert_eq!(app.editor.text(), ":bc");
+        assert_eq!(app.mode(), AppMode::Editing);
+    }
+
+    #[test]
+    fn routes_character_find_target_before_command_line() {
+        let mut app = App::new(None).unwrap();
+        app.editor.replace_text("a:q");
+        for character in "f:".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE))
+                .unwrap();
+        }
+        assert_eq!(app.editor.cursor, wed::core::CharPos(1));
+        assert_eq!(app.mode(), AppMode::Editing);
     }
 
     #[test]
