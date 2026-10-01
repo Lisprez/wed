@@ -68,7 +68,14 @@ impl App {
         self.editor.is_dirty()
     }
 
+    pub fn set_viewport_height(&mut self, height: usize) {
+        self.editor.set_viewport_height(height);
+    }
+
     pub fn handle_key(&mut self, key: KeyEvent) -> io::Result<AppOutcome> {
+        for error in clipboard::take_errors() {
+            self.editor.message = format!("Clipboard copy failed: {error}");
+        }
         if self.mode == AppMode::QuitPrompt {
             return self.handle_quit_prompt(key);
         }
@@ -98,7 +105,7 @@ impl App {
             return Ok(AppOutcome::Continue);
         }
         let key = convert_key(key);
-        self.handle_editor_key(key, &clipboard::set_contents)
+        self.handle_editor_key(key, &clipboard::queue_contents)
     }
 
     fn handle_editor_key(

@@ -44,6 +44,7 @@ fn main() -> io::Result<()> {
     let path = std::env::args_os().nth(1).map(PathBuf::from);
     let mut app = App::new(path)?;
     let mut renderer = Renderer::new()?;
+    app.set_viewport_height(renderer.text_height());
     renderer.render(&app)?;
 
     // Block until an event arrives rather than polling on a timer: an idle
@@ -58,10 +59,12 @@ fn main() -> io::Result<()> {
                 if app.handle_key(key)? == AppOutcome::Quit {
                     break;
                 }
+                app.set_viewport_height(renderer.text_height());
                 renderer.render(&app)?;
             }
             Event::Resize(width, height) => {
                 renderer.resize(width, height);
+                app.set_viewport_height(renderer.text_height());
                 renderer.render(&app)?;
             }
             _ => {}

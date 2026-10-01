@@ -1,4 +1,35 @@
 use std::io;
+use std::sync::{Mutex, OnceLock};
+
+fn error_queue() -> &'static Mutex<Vec<String>> {
+    static QUEUE: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+    QUEUE.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Queues a clipboard write on a background thread so a large yank never
+/// blocks the editing loop. Failures are collected for [`take_errors`].
+pub fn queue_contents(text: &str) -> io::Result<()> {
+    let owned = text.to_string();
+    std::thread::Builder::new()
+        .name("wed-clipboard".to_string())
+        .spawn(move || {
+            if let Err(error) = set_contents(&owned) {
+                if let Ok(mut queue) = error_queue().lock() {
+                    queue.push(error.to_string());
+                }
+            }
+        })
+        .map(|_| ())
+        .map_err(|error| io::Error::other(format!("clipboard thread failed: {error}")))
+}
+
+/// Drains clipboard failures reported by background writes.
+pub fn take_errors() -> Vec<String> {
+    error_queue()
+        .lock()
+        .map(|mut queue| std::mem::take(&mut *queue))
+        .unwrap_or_default()
+}
 
 pub fn set_contents(text: &str) -> io::Result<()> {
     #[cfg(target_os = "windows")]
@@ -172,5 +203,15 @@ mod win32 {
             }
         }
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::take_errors;
+
+    #[test]
+    fn error_queue_starts_empty_and_drains() {
+        assert!(take_errors().is_empty());
     }
 }

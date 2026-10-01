@@ -6,15 +6,25 @@ use crossterm::{
     terminal::{size, Clear, ClearType},
 };
 use std::io::{self, BufWriter, Write};
+use std::rc::Rc;
 use wed::core::{CharPos, CharRange, Document, LineColumn, Mode, Selection};
 
 const TAB_STOP: usize = 8;
+/// Spaces emitted for a (possibly clipped) tab; a tab never covers more
+/// than one tab stop, so slicing this avoids a per-tab allocation.
+const TAB_SPACES: &str = "        ";
+/// Padding for the status line; sliced instead of `" ".repeat(n)`.
+const PAD_SPACES: [u8; 4096] = [b' '; 4096];
 
-/// Buffers reused across frames so painting a row does not allocate.
+fn pad_spaces(n: usize) -> &'static str {
+    let n = n.min(PAD_SPACES.len());
+    // SAFETY: `PAD_SPACES` is all ASCII spaces.
+    unsafe { std::str::from_utf8_unchecked(&PAD_SPACES[..n]) }
+}
+
+/// Buffer reused across frames so painting a row does not allocate.
 #[derive(Default)]
 struct Scratch {
-    /// Holds the current row's document text.
-    line: String,
     /// Accumulates one run of same-styled glyphs before they are printed.
     run: String,
 }
@@ -26,9 +36,9 @@ pub struct Renderer {
     row_offset: usize,
     col_offset: usize,
     scratch: Scratch,
-    cached_cursor_display: Option<(CharPos, usize)>,
-    cached_selection_ranges: Option<(Option<Selection>, Vec<CharRange>)>,
-    cached_matching_partner: Option<(CharPos, usize, Option<CharPos>)>,
+    cached_cursor_display: Option<(CharPos, u64, usize)>,
+    cached_selection_ranges: Option<(Option<Selection>, u64, Rc<[CharRange]>)>,
+    cached_matching_partner: Option<(CharPos, u64, Option<CharPos>)>,
 }
 
 impl Renderer {
@@ -52,6 +62,10 @@ impl Renderer {
         self.height = height;
     }
 
+    pub fn text_height(&self) -> usize {
+        (self.height as usize).saturating_sub(2)
+    }
+
     pub fn render(&mut self, app: &App) -> io::Result<()> {
         queue!(self.writer, Hide)?;
         let text_height = (self.height as usize).saturating_sub(2);
@@ -63,12 +77,17 @@ impl Renderer {
 
         let editor = &app.editor;
         let document = &editor.document;
+        let revision = editor.revision();
         let cursor = document.pos_to_line_col(editor.cursor);
         let cursor_display_column = match self.cached_cursor_display {
-            Some((cached_cursor, cached_display)) if cached_cursor == editor.cursor => cached_display,
+            Some((cached_cursor, cached_revision, cached_display))
+                if cached_cursor == editor.cursor && cached_revision == revision =>
+            {
+                cached_display
+            }
             _ => {
                 let display = self.cursor_display_column(document, cursor);
-                self.cached_cursor_display = Some((editor.cursor, display));
+                self.cached_cursor_display = Some((editor.cursor, revision, display));
                 display
             }
         };
@@ -85,27 +104,33 @@ impl Renderer {
             self.col_offset = cursor_display_column - text_width + 1;
         }
 
-        let selection_ranges = match &self.cached_selection_ranges {
-            Some((cached_selection, ranges)) if *cached_selection == editor.selection => ranges.clone(),
+        let selection_ranges: Rc<[CharRange]> = match &self.cached_selection_ranges {
+            Some((cached_selection, cached_revision, ranges))
+                if *cached_selection == editor.selection && *cached_revision == revision =>
+            {
+                Rc::clone(ranges)
+            }
             _ => {
-                let ranges = editor
+                let ranges: Rc<[CharRange]> = editor
                     .selection
                     .as_ref()
                     .map(|selection| selection.ranges(document))
-                    .unwrap_or_default();
-                self.cached_selection_ranges = Some((editor.selection.clone(), ranges.clone()));
+                    .unwrap_or_default()
+                    .into();
+                self.cached_selection_ranges =
+                    Some((editor.selection.clone(), revision, Rc::clone(&ranges)));
                 ranges
             }
         };
         let matching_partner = match self.cached_matching_partner {
-            Some((cached_cursor, doc_len, cached_partner))
-                if cached_cursor == editor.cursor && doc_len == document.len_chars() =>
+            Some((cached_cursor, cached_revision, cached_partner))
+                if cached_cursor == editor.cursor && cached_revision == revision =>
             {
                 cached_partner
             }
             _ => {
                 let partner = matching_partner_for_render(app);
-                self.cached_matching_partner = Some((editor.cursor, document.len_chars(), partner));
+                self.cached_matching_partner = Some((editor.cursor, revision, partner));
                 partner
             }
         };
@@ -124,7 +149,7 @@ impl Renderer {
                         file_row,
                         col_offset: self.col_offset,
                         text_width,
-                        selection_ranges: &selection_ranges,
+                        selection_ranges: &selection_ranges[..],
                         matching_partner,
                     },
                     &mut self.scratch,
@@ -156,13 +181,16 @@ impl Renderer {
     }
 
     /// Display column of `location.column` within its own line.
-    fn cursor_display_column(&mut self, document: &Document, location: LineColumn) -> usize {
-        self.scratch.line.clear();
-        document.write_slice(
-            document.line_content_range(location.line),
-            &mut self.scratch.line,
-        );
-        display_column(&self.scratch.line, location.column)
+    ///
+    /// Computed straight from the rope without materialising the line, so a
+    /// long line costs O(cursor column) rather than O(line length).
+    fn cursor_display_column(&self, document: &Document, location: LineColumn) -> usize {
+        let start = document.line_start(location.line);
+        let mut column = 0;
+        for (_, character) in document.chars_from(start).take(location.column) {
+            column += display_width(character, column);
+        }
+        column
     }
 
     fn render_status(
@@ -192,14 +220,27 @@ impl Renderer {
                 ResetColor
             )?;
         } else {
-            let padding = " ".repeat(width - left_len - right_len);
-            queue!(
-                self.writer,
-                SetBackgroundColor(Color::White),
-                SetForegroundColor(Color::Black),
-                Print(format!("{}{}{}", left, padding, right)),
-                ResetColor
-            )?;
+            let gap = width - left_len - right_len;
+            if gap <= PAD_SPACES.len() {
+                queue!(
+                    self.writer,
+                    SetBackgroundColor(Color::White),
+                    SetForegroundColor(Color::Black),
+                    Print(left),
+                    Print(pad_spaces(gap)),
+                    Print(right),
+                    ResetColor
+                )?;
+            } else {
+                let padding = " ".repeat(gap);
+                queue!(
+                    self.writer,
+                    SetBackgroundColor(Color::White),
+                    SetForegroundColor(Color::Black),
+                    Print(format!("{}{}{}", left, padding, right)),
+                    ResetColor
+                )?;
+            }
         }
         Ok(())
     }
@@ -207,30 +248,27 @@ impl Renderer {
     fn render_message(&mut self, app: &App) -> io::Result<()> {
         let row = self.height.saturating_sub(1);
         queue!(self.writer, MoveTo(0, row), Clear(ClearType::CurrentLine))?;
+        let owned;
         let (message, color) = if app.mode() == AppMode::QuitPrompt {
-            (
-                "Unsaved changes! Save first? (y/n/c)".to_string(),
-                Color::Red,
-            )
+            ("Unsaved changes! Save first? (y/n/c)", Color::Red)
         } else if app.mode() == AppMode::CommandLine {
-            (
-                app.command_prompt().unwrap_or_else(|| ":".to_string()),
-                Color::Cyan,
-            )
+            owned = app.command_prompt().unwrap_or_else(|| ":".to_string());
+            (&owned[..], Color::Cyan)
         } else {
             match app.editor.mode {
-                Mode::Search => (
-                    app.editor
+                Mode::Search => {
+                    owned = app
+                        .editor
                         .search_prompt()
-                        .unwrap_or_else(|| app.editor.message.clone()),
-                    Color::Yellow,
-                ),
-                Mode::Insert => (app.editor.message.clone(), Color::Green),
-                Mode::CommandLine => (app.editor.message.clone(), Color::Cyan),
-                _ => (app.editor.message.clone(), Color::White),
+                        .unwrap_or_else(|| app.editor.message.clone());
+                    (&owned[..], Color::Yellow)
+                }
+                Mode::Insert => (&app.editor.message[..], Color::Green),
+                Mode::CommandLine => (&app.editor.message[..], Color::Cyan),
+                _ => (&app.editor.message[..], Color::White),
             }
         };
-        let visible = safe_text(&message, self.width as usize);
+        let visible = safe_text(message, self.width as usize);
         queue!(
             self.writer,
             SetForegroundColor(color),
@@ -277,40 +315,23 @@ fn paint_line<W: Write>(writer: &mut W, row: Row<'_>, scratch: &mut Scratch) -> 
     let content = document.line_content_range(file_row);
     let line_start = content.start.0;
     let viewport_end = col_offset + text_width;
-    scratch.line.clear();
-    let mut viewport_start_char_index = 0;
-    let mut viewport_start_column = 0;
-    let mut column = 0;
-    for (position, character) in document.chars_from(CharPos(line_start)) {
-        if position.0 >= content.end.0 {
+    scratch.run.reserve(text_width);
+    let mut painter = RowPainter::new(writer, &mut scratch.run);
+    let mut column = 0usize;
+    let mut range_cursor = 0usize;
+    for (char_index, character) in document.chars_from(CharPos(line_start)) {
+        if char_index.0 >= content.end.0 {
             break;
         }
-        let display_end = column + display_width(character, column);
+        let display_start = column;
+        let display_end = display_start + display_width(character, display_start);
         if display_end <= col_offset {
             column = display_end;
-            viewport_start_char_index += 1;
             continue;
         }
-        if column >= viewport_end {
-            break;
-        }
-        if scratch.line.is_empty() {
-            viewport_start_column = column;
-        }
-        scratch.line.push(character);
-        column = display_end;
-    }
-
-    let mut painter = RowPainter::new(writer, &mut scratch.run);
-    let mut column = viewport_start_column;
-    let mut range_cursor = 0usize;
-    for (offset, character) in scratch.line.chars().enumerate() {
-        let display_start = column;
         if display_start >= viewport_end {
             break;
         }
-        let display_end = display_start + display_width(character, display_start);
-        let char_index = CharPos(line_start + viewport_start_char_index + offset);
         while selection_ranges
             .get(range_cursor)
             .is_some_and(|range| range.end <= char_index)
@@ -331,7 +352,7 @@ fn paint_line<W: Write>(writer: &mut W, row: Row<'_>, scratch: &mut Scratch) -> 
             let visible_start = display_start.max(col_offset);
             let visible_end = display_end.min(viewport_end);
             painter.push(
-                &" ".repeat(visible_end.saturating_sub(visible_start)),
+                &TAB_SPACES[..visible_end.saturating_sub(visible_start)],
                 style,
             )?;
         } else {
@@ -419,6 +440,7 @@ fn display_width(character: char, column: usize) -> usize {
     }
 }
 
+#[cfg(test)]
 fn display_column(line: &str, char_column: usize) -> usize {
     let mut column = 0;
     for character in line.chars().take(char_column) {

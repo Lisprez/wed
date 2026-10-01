@@ -69,6 +69,12 @@ struct PendingCommand {
     g_pending: bool,
 }
 
+impl PendingCommand {
+    fn combined_count(self) -> usize {
+        self.count.saturating_mul(self.motion_count.unwrap_or(1))
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FindKind {
     Forward,
@@ -156,6 +162,9 @@ impl Selection {
     }
 }
 
+/// Fallback page size before the terminal reports its real height.
+const DEFAULT_VIEWPORT_HEIGHT: usize = 10;
+
 pub struct Editor {
     pub document: Document,
     pub cursor: CharPos,
@@ -165,6 +174,7 @@ pub struct Editor {
     search_input: String,
     search_backwards: bool,
     last_search: Option<String>,
+    search_buffer: String,
     pub history: History,
     revision: u64,
     saved_revision: u64,
@@ -177,6 +187,7 @@ pub struct Editor {
     replace_pending: bool,
     unnamed_register: Option<RegisterValue>,
     pending_clipboard_text: Option<String>,
+    viewport_height: usize,
 }
 
 impl Editor {
@@ -194,6 +205,7 @@ impl Editor {
             search_input: String::new(),
             search_backwards: false,
             last_search: None,
+            search_buffer: String::new(),
             history: History::new(),
             revision: 0,
             saved_revision: 0,
@@ -206,11 +218,20 @@ impl Editor {
             replace_pending: false,
             unnamed_register: None,
             pending_clipboard_text: None,
+            viewport_height: DEFAULT_VIEWPORT_HEIGHT,
         }
     }
 
     pub fn is_dirty(&self) -> bool {
         self.revision != self.saved_revision
+    }
+
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    pub fn set_viewport_height(&mut self, height: usize) {
+        self.viewport_height = height.max(1);
     }
 
     pub fn mark_saved(&mut self) {
@@ -280,26 +301,23 @@ impl Editor {
             return 0;
         }
         let original = self.text();
-        let count = if global {
-            original.matches(needle).count()
-        } else if original.contains(needle) {
-            1
-        } else {
-            0
-        };
-        if count == 0 {
-            self.message = format!("Pattern not found: {}", needle);
-            return 0;
-        }
+        // Single pass counts and builds at once; the old code scanned once
+        // to count and a second time to build.
         let mut replaced = String::with_capacity(original.len());
         let mut last_end = 0;
+        let mut count = 0;
         for (start, matched) in original.match_indices(needle) {
             replaced.push_str(&original[last_end..start]);
             replaced.push_str(replacement);
             last_end = start + matched.len();
+            count += 1;
             if !global {
                 break;
             }
+        }
+        if count == 0 {
+            self.message = format!("Pattern not found: {}", needle);
+            return 0;
         }
         replaced.push_str(&original[last_end..]);
         let range = CharRange::new(CharPos::ZERO, CharPos(self.document.len_chars()));
@@ -320,9 +338,12 @@ impl Editor {
         self.mode = Mode::Normal;
     }
 
-    fn handle_normal_key(&mut self, key: Key) -> EditorOutcome {
+    /// Consumes keys claimed by an in-progress multi-key sequence.
+    /// Returns `Some` when `key` was fully handled and the main dispatch
+    /// must be skipped.
+    fn preprocess_normal_key(&mut self, key: Key) -> Option<EditorOutcome> {
         if self.handle_pending_find(key) {
-            return EditorOutcome::Continue;
+            return Some(EditorOutcome::Continue);
         }
         if self.replace_pending {
             if let Key::Char(character) = key {
@@ -331,7 +352,7 @@ impl Editor {
             } else if key == Key::Escape {
                 self.replace_pending = false;
             }
-            return EditorOutcome::Continue;
+            return Some(EditorOutcome::Continue);
         }
         if self.g_pending {
             self.g_pending = false;
@@ -339,12 +360,19 @@ impl Editor {
                 let count = self.take_count();
                 self.move_with(Motion::GotoFirst, count);
             }
-            return EditorOutcome::Continue;
+            return Some(EditorOutcome::Continue);
         }
         if let Key::Char(character) = key {
             if self.accumulate_normal_digit(character) {
-                return EditorOutcome::Continue;
+                return Some(EditorOutcome::Continue);
             }
+        }
+        None
+    }
+
+    fn handle_normal_key(&mut self, key: Key) -> EditorOutcome {
+        if let Some(outcome) = self.preprocess_normal_key(key) {
+            return outcome;
         }
         match key {
             Key::Escape => self.reset_pending(),
@@ -429,9 +457,16 @@ impl Editor {
                 let query = self.search_input.clone();
                 if !query.is_empty() {
                     self.last_search = Some(query.clone());
-                    if let Some(target) =
-                        find_search(&self.document, self.cursor, &query, self.search_backwards)
-                    {
+                    let mut buffer = std::mem::take(&mut self.search_buffer);
+                    let target = find_search(
+                        &self.document,
+                        self.cursor,
+                        &query,
+                        self.search_backwards,
+                        &mut buffer,
+                    );
+                    self.search_buffer = buffer;
+                    if let Some(target) = target {
                         self.cursor = target;
                         self.message.clear();
                     } else {
@@ -451,7 +486,10 @@ impl Editor {
             return;
         };
         let backwards = self.search_backwards ^ reverse;
-        if let Some(target) = find_search(&self.document, self.cursor, &query, backwards) {
+        let mut buffer = std::mem::take(&mut self.search_buffer);
+        let target = find_search(&self.document, self.cursor, &query, backwards, &mut buffer);
+        self.search_buffer = buffer;
+        if let Some(target) = target {
             self.cursor = target;
             self.message.clear();
         } else {
@@ -578,103 +616,136 @@ impl Editor {
         if self.handle_pending_find(key) {
             return EditorOutcome::Continue;
         }
-        let Some(mut pending) = self.pending else {
+        let Some(pending) = self.pending else {
             self.mode = Mode::Normal;
             return EditorOutcome::Continue;
         };
-        if let Some(prefix) = pending.prefix {
-            if let Key::Char(character) = key {
-                if let Some(object) =
-                    textobject::parse(if prefix.around { 'a' } else { 'i' }, character)
-                {
-                    let count = pending
-                        .count
-                        .saturating_mul(pending.motion_count.unwrap_or(1));
-                    self.pending = None;
-                    self.apply_text_object(pending.operator, object, count);
-                } else {
-                    self.pending = None;
-                    self.mode = Mode::Normal;
-                    self.message = "Unknown text object".to_string();
-                }
-            }
+        if pending.prefix.is_some() {
+            return self.handle_pending_text_object(pending, key);
+        }
+        let Key::Char(character) = key else {
+            self.cancel_pending();
+            return EditorOutcome::Continue;
+        };
+        if self.handle_pending_digit(pending, character) {
             return EditorOutcome::Continue;
         }
+        if pending.g_pending {
+            return self.handle_pending_g(pending, character);
+        }
+        if let Some(outcome) = self.handle_pending_find_key(pending, character) {
+            return outcome;
+        }
+        if operator_for_key(character) == Some(pending.operator) {
+            self.pending = None;
+            self.apply_line_operator(pending.operator, pending.count);
+            return EditorOutcome::Continue;
+        }
+        if character == 'i' || character == 'a' {
+            self.pending = Some(PendingCommand {
+                prefix: Some(ObjectPrefix {
+                    around: character == 'a',
+                }),
+                ..pending
+            });
+            return EditorOutcome::Continue;
+        }
+        if character == 'g' {
+            self.pending = Some(PendingCommand {
+                g_pending: true,
+                ..pending
+            });
+            return EditorOutcome::Continue;
+        }
+        if character == 'G' {
+            self.pending = None;
+            self.apply_line_motion(
+                pending.operator,
+                pending.combined_count(),
+                Motion::GotoLast,
+            );
+            return EditorOutcome::Continue;
+        }
+        if let Some(motion) = motion_for_key(character) {
+            self.pending = None;
+            let count = pending.combined_count();
+            let result = motion::resolve(&self.document, self.cursor, motion, count);
+            self.apply_motion_result(pending.operator, result, count);
+            return EditorOutcome::Continue;
+        }
+        self.cancel_pending();
+        EditorOutcome::Continue
+    }
+
+    fn handle_pending_text_object(&mut self, pending: PendingCommand, key: Key) -> EditorOutcome {
+        let Some(prefix) = pending.prefix else {
+            return EditorOutcome::Continue;
+        };
         if let Key::Char(character) = key {
-            if character.is_ascii_digit() && (character != '0' || pending.motion_count.is_some()) {
-                pending.motion_count = Some(
-                    pending
-                        .motion_count
-                        .unwrap_or(0)
-                        .saturating_mul(10)
-                        .saturating_add(character.to_digit(10).unwrap_or(0) as usize),
-                );
-                self.pending = Some(pending);
-                return EditorOutcome::Continue;
-            }
-            if pending.g_pending {
-                pending.g_pending = false;
-                if character == 'g' {
-                    self.pending = None;
-                    self.apply_line_motion(pending.operator, pending.count, Motion::GotoFirst);
-                    return EditorOutcome::Continue;
-                }
+            if let Some(object) =
+                textobject::parse(if prefix.around { 'a' } else { 'i' }, character)
+            {
+                self.pending = None;
+                self.apply_text_object(pending.operator, object, pending.combined_count());
+            } else {
                 self.pending = None;
                 self.mode = Mode::Normal;
-                return EditorOutcome::Continue;
-            }
-            if let Some(kind) = find_kind_for_key(character) {
-                let count = pending
-                    .count
-                    .saturating_mul(pending.motion_count.unwrap_or(1));
-                self.begin_find_with_count(kind, count);
-                return EditorOutcome::Continue;
-            }
-            if character == ';' || character == ',' {
-                let count = pending
-                    .count
-                    .saturating_mul(pending.motion_count.unwrap_or(1));
-                self.repeat_find(character == ',', count);
-                return EditorOutcome::Continue;
-            }
-            if operator_for_key(character) == Some(pending.operator) {
-                self.pending = None;
-                self.apply_line_operator(pending.operator, pending.count);
-                return EditorOutcome::Continue;
-            }
-            if character == 'i' || character == 'a' {
-                pending.prefix = Some(ObjectPrefix {
-                    around: character == 'a',
-                });
-                self.pending = Some(pending);
-                return EditorOutcome::Continue;
-            }
-            if character == 'g' {
-                pending.g_pending = true;
-                self.pending = Some(pending);
-                return EditorOutcome::Continue;
-            }
-            if character == 'G' {
-                self.pending = None;
-                let count = pending
-                    .count
-                    .saturating_mul(pending.motion_count.unwrap_or(1));
-                self.apply_line_motion(pending.operator, count, Motion::GotoLast);
-                return EditorOutcome::Continue;
-            }
-            if let Some(motion) = motion_for_key(character) {
-                self.pending = None;
-                let count = pending
-                    .count
-                    .saturating_mul(pending.motion_count.unwrap_or(1));
-                let result = motion::resolve(&self.document, self.cursor, motion, count);
-                self.apply_motion_result(pending.operator, result, count);
-                return EditorOutcome::Continue;
+                self.message = "Unknown text object".to_string();
             }
         }
+        EditorOutcome::Continue
+    }
+
+    fn handle_pending_digit(&mut self, pending: PendingCommand, character: char) -> bool {
+        if !character.is_ascii_digit()
+            || (character == '0' && pending.motion_count.is_none())
+        {
+            return false;
+        }
+        let digit = character.to_digit(10).unwrap_or(0) as usize;
+        self.pending = Some(PendingCommand {
+            motion_count: Some(
+                pending
+                    .motion_count
+                    .unwrap_or(0)
+                    .saturating_mul(10)
+                    .saturating_add(digit),
+            ),
+            ..pending
+        });
+        true
+    }
+
+    fn handle_pending_g(&mut self, pending: PendingCommand, character: char) -> EditorOutcome {
+        self.pending = None;
+        if character == 'g' {
+            self.apply_line_motion(pending.operator, pending.count, Motion::GotoFirst);
+        } else {
+            self.mode = Mode::Normal;
+        }
+        EditorOutcome::Continue
+    }
+
+    fn handle_pending_find_key(
+        &mut self,
+        pending: PendingCommand,
+        character: char,
+    ) -> Option<EditorOutcome> {
+        let count = pending.combined_count();
+        if let Some(kind) = find_kind_for_key(character) {
+            self.begin_find_with_count(kind, count);
+            return Some(EditorOutcome::Continue);
+        }
+        if character == ';' || character == ',' {
+            self.repeat_find(character == ',', count);
+            return Some(EditorOutcome::Continue);
+        }
+        None
+    }
+
+    fn cancel_pending(&mut self) {
         self.pending = None;
         self.mode = Mode::Normal;
-        EditorOutcome::Continue
     }
 
     fn apply_motion_key(&mut self, key: Key) {
@@ -1056,11 +1127,13 @@ impl Editor {
         }
         match operator {
             Operator::Yank => {
-                let text = ranges
-                    .iter()
-                    .map(|range| self.document.slice(*range))
-                    .collect::<Vec<_>>()
-                    .join("\n");
+                let mut text = String::new();
+                for (index, range) in ranges.iter().enumerate() {
+                    if index > 0 {
+                        text.push('\n');
+                    }
+                    self.document.write_slice(*range, &mut text);
+                }
                 self.unnamed_register = Some(RegisterValue {
                     text: text.clone(),
                     kind: register_kind(match selection.kind {
@@ -1370,7 +1443,7 @@ impl Editor {
     }
 
     fn viewport_lines(&self) -> usize {
-        10
+        self.viewport_height
     }
 
     pub fn insert_text_for_test(&mut self, text: &str) {
@@ -1475,6 +1548,7 @@ fn find_search(
     cursor: CharPos,
     query: &str,
     backwards: bool,
+    buffer: &mut String,
 ) -> Option<CharPos> {
     let needle = query.chars().count();
     let len = document.len_chars();
@@ -1486,13 +1560,13 @@ fn find_search(
             return None;
         }
         let limit = cursor.0.min(len);
-        find_last_match(document, query, limit)
+        find_last_match(document, query, limit, buffer)
     } else {
         let from = cursor.0.saturating_add(1);
         if from + needle > len {
             return None;
         }
-        find_first_match(document, query, from)
+        find_first_match(document, query, from, buffer)
     }
 }
 
@@ -1501,16 +1575,22 @@ fn find_search(
 /// The document is examined one overlapping chunk at a time and matched with the
 /// standard library's substring search, so the cost is driven by the document
 /// size rather than by one rope lookup per candidate position.
-fn find_first_match(document: &Document, query: &str, from: usize) -> Option<CharPos> {
+fn find_first_match(
+    document: &Document,
+    query: &str,
+    from: usize,
+    buffer: &mut String,
+) -> Option<CharPos> {
     let len = document.len_chars();
     let needle = query.chars().count();
-    let mut buffer = String::with_capacity(SEARCH_CHUNK + needle);
+    buffer.clear();
+    buffer.reserve(SEARCH_CHUNK + needle);
     let mut chunk = 0usize;
     while chunk < len {
         // Overlap by the needle so matches spanning a boundary stay visible.
         let end = (chunk + SEARCH_CHUNK + needle - 1).min(len);
         buffer.clear();
-        document.write_slice(CharRange::new(CharPos(chunk), CharPos(end)), &mut buffer);
+        document.write_slice(CharRange::new(CharPos(chunk), CharPos(end)), &mut *buffer);
         let earliest = from.max(chunk);
         let start_byte = if earliest > chunk {
             buffer
@@ -1534,15 +1614,21 @@ fn find_first_match(document: &Document, query: &str, from: usize) -> Option<Cha
 ///
 /// A match may begin before `limit` and still extend past it, so candidates are
 /// rejected on their start position rather than on where the needle ends.
-fn find_last_match(document: &Document, query: &str, limit: usize) -> Option<CharPos> {
+fn find_last_match(
+    document: &Document,
+    query: &str,
+    limit: usize,
+    buffer: &mut String,
+) -> Option<CharPos> {
     let len = document.len_chars();
     let needle = query.chars().count();
-    let mut buffer = String::with_capacity(SEARCH_CHUNK + needle);
+    buffer.clear();
+    buffer.reserve(SEARCH_CHUNK + needle);
     let mut chunk = (limit - 1) / SEARCH_CHUNK * SEARCH_CHUNK;
     loop {
         let end = (chunk + SEARCH_CHUNK + needle - 1).min(len);
         buffer.clear();
-        document.write_slice(CharRange::new(CharPos(chunk), CharPos(end)), &mut buffer);
+        document.write_slice(CharRange::new(CharPos(chunk), CharPos(end)), &mut *buffer);
         let mut searchable = buffer.len();
         while searchable > 0 {
             let Some(found) = buffer[..searchable].rfind(query) else {

@@ -307,96 +307,141 @@ fn pair_object(
 }
 
 fn tag_object(document: &Document, cursor: CharPos, around: bool) -> Option<CharRange> {
-    let tags = all_tags(document);
+    // Lexes and matches in one pass: the old code lexed the whole document
+    // into a `Vec<Tag>` first, but matching only ever needs the first pair
+    // closed in document order that contains the cursor, so tags after that
+    // point are never read.
     let mut stack: Vec<(String, usize)> = Vec::new();
-    let mut pair = None;
-    for tag in &tags {
-        if tag.closing {
-            if let Some(index) = stack.iter().rposition(|(name, _)| *name == tag.name) {
-                let (_, open) = stack.remove(index);
-                if cursor.0 >= open && cursor.0 <= tag.end {
-                    pair = Some((open, tag.end));
-                    break;
+    let mut chars = document.chars_from(CharPos::ZERO);
+    while let Some((index, character)) = chars.next() {
+        if character != '<' {
+            continue;
+        }
+        // One pass to the closing '>', so a document full of '<' does not
+        // rescan the remainder of the file for every one of them.
+        let mut body = String::new();
+        let mut closed = None;
+        for (position, inner) in chars.by_ref() {
+            if inner == '>' {
+                closed = Some(position);
+                break;
+            }
+            body.push(inner);
+        }
+        let Some(end) = closed else {
+            break;
+        };
+        let trimmed = body.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let closing = trimmed.starts_with('/');
+        let self_closing = trimmed.ends_with('/');
+        let name = trimmed
+            .trim_start_matches('/')
+            .trim_end_matches('/')
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if name.is_empty() {
+            continue;
+        }
+        if closing {
+            if let Some(stack_index) = stack.iter().rposition(|(open_name, _)| *open_name == name)
+            {
+                let (_, open) = stack.remove(stack_index);
+                if cursor.0 >= open && cursor.0 <= end.0 {
+                    return Some(if around {
+                        CharRange::new(CharPos(open), CharPos(end.0 + 1))
+                    } else {
+                        CharRange::new(CharPos(open + 1), CharPos(end.0))
+                    });
                 }
             }
-        } else if !tag.self_closing {
-            stack.push((tag.name.clone(), tag.start));
+        } else if !self_closing {
+            stack.push((name, index.0));
         }
     }
-    let (open, close) = pair?;
-    Some(if around {
-        CharRange::new(CharPos(open), CharPos(close + 1))
-    } else {
-        CharRange::new(CharPos(open + 1), CharPos(close))
-    })
+    None
 }
 
 fn unit_bounds(document: &Document, position: usize, big: bool) -> (usize, usize) {
     let kind = word_kind(document.char_at(CharPos(position)), big);
     let mut start = position;
-    let mut end = position + 1;
-    while start > 0 && word_kind(document.char_at(CharPos(start - 1)), big) == kind {
-        start -= 1;
+    for (at, character) in document.chars_before(CharPos(position + 1)) {
+        if word_kind(Some(character), big) != kind {
+            break;
+        }
+        start = at.0;
     }
-    while end < document.len_chars() && word_kind(document.char_at(CharPos(end)), big) == kind {
-        end += 1;
+    let mut end = position + 1;
+    for (at, character) in document.chars_from(CharPos(position + 1)) {
+        if word_kind(Some(character), big) != kind {
+            break;
+        }
+        end = at.0 + 1;
     }
     (start, end)
 }
 
 fn next_unit_start(document: &Document, start: usize, big: bool) -> usize {
+    let len = document.len_chars();
     let mut index = start;
-    while index < document.len_chars()
-        && word_kind(document.char_at(CharPos(index)), big) != WordKind::Whitespace
-    {
-        index += 1;
+    for (at, character) in document.chars_from(CharPos(start)) {
+        if word_kind(Some(character), big) == WordKind::Whitespace {
+            index = at.0;
+            break;
+        }
+        index = at.0 + 1;
     }
-    while index < document.len_chars()
-        && word_kind(document.char_at(CharPos(index)), big) == WordKind::Whitespace
-    {
-        index += 1;
+    if index >= len {
+        return len;
     }
-    index
+    for (at, character) in document.chars_from(CharPos(index)) {
+        if word_kind(Some(character), big) != WordKind::Whitespace {
+            return at.0;
+        }
+    }
+    len
 }
 
 fn include_adjacent_whitespace(document: &Document, start: usize, end: usize) -> CharRange {
-    let mut new_start = start;
     let mut new_end = end;
-    while new_end < document.len_chars()
-        && document
-            .char_at(CharPos(new_end))
-            .is_some_and(|character| matches!(character, ' ' | '\t'))
-    {
-        new_end += 1;
+    for (at, character) in document.chars_from(CharPos(end)) {
+        if !matches!(character, ' ' | '\t') {
+            break;
+        }
+        new_end = at.0 + 1;
     }
+    let mut new_start = start;
     if new_end == end {
-        while new_start > 0
-            && document
-                .char_at(CharPos(new_start - 1))
-                .is_some_and(|character| matches!(character, ' ' | '\t'))
-        {
-            new_start -= 1;
+        for (at, character) in document.chars_before(CharPos(start)) {
+            if !matches!(character, ' ' | '\t') {
+                break;
+            }
+            new_start = at.0;
         }
     }
     CharRange::new(CharPos(new_start), CharPos(new_end))
 }
 
 fn sentence_start_containing(document: &Document, position: usize) -> usize {
-    let mut start = 0;
-    for (at, character) in document.chars_from(CharPos::ZERO) {
+    // Nearest terminator first: at most one boundary run can straddle
+    // `position`, and it must start at the nearest terminator before it,
+    // so the first valid boundary met walking backwards is also the last
+    // one a forward scan would record.
+    for (at, character) in document.chars_before(CharPos(position)) {
         let index = at.0;
-        if index >= position {
-            break;
-        }
         let Some(end) = sentence_boundary_at(document, index, character) else {
             continue;
         };
         if end > position {
             return index;
         }
-        start = end;
+        return end;
     }
-    start
+    0
 }
 
 fn next_sentence_start(document: &Document, start: usize) -> usize {
@@ -460,11 +505,18 @@ fn enclosing_pair(document: &Document, cursor: CharPos, kind: PairKind) -> Optio
     }
     let open = open?;
     let mut depth = 0usize;
+    let mut backslashes = 0usize;
     for (at, character) in document.chars_from(CharPos(open)) {
         let index = at.0;
-        if character == open_character && !is_escaped(document, index) {
+        if character == '\\' {
+            backslashes += 1;
+            continue;
+        }
+        let escaped = backslashes % 2 == 1;
+        backslashes = 0;
+        if character == open_character && !escaped {
             depth += 1;
-        } else if character == close_character && !is_escaped(document, index) {
+        } else if character == close_character && !escaped {
             depth = depth.saturating_sub(1);
             if depth == 0 {
                 return Some((open, index));
@@ -499,11 +551,18 @@ fn matching_close(
     close_character: char,
 ) -> Option<usize> {
     let mut depth = 0usize;
+    let mut backslashes = 0usize;
     for (at, character) in document.chars_from(CharPos(open)) {
         let index = at.0;
-        if character == open_character && !is_escaped(document, index) {
+        if character == '\\' {
+            backslashes += 1;
+            continue;
+        }
+        let escaped = backslashes % 2 == 1;
+        backslashes = 0;
+        if character == open_character && !escaped {
             depth += 1;
-        } else if character == close_character && !is_escaped(document, index) {
+        } else if character == close_character && !escaped {
             depth = depth.saturating_sub(1);
             if depth == 0 {
                 return Some(index);
@@ -552,61 +611,6 @@ fn is_blank_line(document: &Document, line: usize) -> bool {
         .chars_from(start)
         .take_while(|(position, _)| position.0 < end.0)
         .all(|(_, character)| character.is_whitespace())
-}
-
-#[derive(Clone)]
-struct Tag {
-    start: usize,
-    end: usize,
-    name: String,
-    closing: bool,
-    self_closing: bool,
-}
-
-fn all_tags(document: &Document) -> Vec<Tag> {
-    let mut tags = Vec::new();
-    let mut chars = document.chars_from(CharPos::ZERO);
-    while let Some((index, character)) = chars.next() {
-        if character != '<' {
-            continue;
-        }
-        // One pass to the closing '>', so a document full of '<' does not
-        // rescan the remainder of the file for every one of them.
-        let mut body = String::new();
-        let mut closed = None;
-        for (position, inner) in chars.by_ref() {
-            if inner == '>' {
-                closed = Some(position);
-                break;
-            }
-            body.push(inner);
-        }
-        let Some(end) = closed else {
-            break;
-        };
-        let trimmed = body.trim();
-        if !trimmed.is_empty() {
-            let closing = trimmed.starts_with('/');
-            let self_closing = trimmed.ends_with('/');
-            let name = trimmed
-                .trim_start_matches('/')
-                .trim_end_matches('/')
-                .split_whitespace()
-                .next()
-                .unwrap_or("")
-                .to_ascii_lowercase();
-            if !name.is_empty() {
-                tags.push(Tag {
-                    start: index.0,
-                    end: end.0,
-                    name,
-                    closing,
-                    self_closing,
-                });
-            }
-        }
-    }
-    tags
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
