@@ -6,7 +6,7 @@ use crossterm::{
     terminal::{size, Clear, ClearType},
 };
 use std::io::{self, BufWriter, Write};
-use wed::core::{CharPos, CharRange, Document, LineColumn, Mode};
+use wed::core::{CharPos, CharRange, Document, LineColumn, Mode, Selection};
 
 const TAB_STOP: usize = 8;
 
@@ -26,6 +26,9 @@ pub struct Renderer {
     row_offset: usize,
     col_offset: usize,
     scratch: Scratch,
+    cached_cursor_display: Option<(CharPos, usize)>,
+    cached_selection_ranges: Option<(Option<Selection>, Vec<CharRange>)>,
+    cached_matching_partner: Option<(CharPos, usize, Option<CharPos>)>,
 }
 
 impl Renderer {
@@ -38,6 +41,9 @@ impl Renderer {
             row_offset: 0,
             col_offset: 0,
             scratch: Scratch::default(),
+            cached_cursor_display: None,
+            cached_selection_ranges: None,
+            cached_matching_partner: None,
         })
     }
 
@@ -58,7 +64,14 @@ impl Renderer {
         let editor = &app.editor;
         let document = &editor.document;
         let cursor = document.pos_to_line_col(editor.cursor);
-        let cursor_display_column = self.cursor_display_column(document, cursor);
+        let cursor_display_column = match self.cached_cursor_display {
+            Some((cached_cursor, cached_display)) if cached_cursor == editor.cursor => cached_display,
+            _ => {
+                let display = self.cursor_display_column(document, cursor);
+                self.cached_cursor_display = Some((editor.cursor, display));
+                display
+            }
+        };
         if cursor.line < self.row_offset {
             self.row_offset = cursor.line;
         }
@@ -72,12 +85,30 @@ impl Renderer {
             self.col_offset = cursor_display_column - text_width + 1;
         }
 
-        let selection_ranges = editor
-            .selection
-            .as_ref()
-            .map(|selection| selection.ranges(document))
-            .unwrap_or_default();
-        let matching_partner = matching_partner_for_render(app);
+        let selection_ranges = match &self.cached_selection_ranges {
+            Some((cached_selection, ranges)) if *cached_selection == editor.selection => ranges.clone(),
+            _ => {
+                let ranges = editor
+                    .selection
+                    .as_ref()
+                    .map(|selection| selection.ranges(document))
+                    .unwrap_or_default();
+                self.cached_selection_ranges = Some((editor.selection.clone(), ranges.clone()));
+                ranges
+            }
+        };
+        let matching_partner = match self.cached_matching_partner {
+            Some((cached_cursor, doc_len, cached_partner))
+                if cached_cursor == editor.cursor && doc_len == document.len_chars() =>
+            {
+                cached_partner
+            }
+            _ => {
+                let partner = matching_partner_for_render(app);
+                self.cached_matching_partner = Some((editor.cursor, document.len_chars(), partner));
+                partner
+            }
+        };
         for screen_row in 0..text_height {
             let file_row = self.row_offset + screen_row;
             queue!(
@@ -245,21 +276,41 @@ fn paint_line<W: Write>(writer: &mut W, row: Row<'_>, scratch: &mut Scratch) -> 
     );
     let content = document.line_content_range(file_row);
     let line_start = content.start.0;
-    scratch.line.clear();
-    document.write_slice(content, &mut scratch.line);
     let viewport_end = col_offset + text_width;
-    let start = viewport_start(&scratch.line, col_offset);
+    scratch.line.clear();
+    let mut viewport_start_char_index = 0;
+    let mut viewport_start_column = 0;
+    let mut column = 0;
+    for (position, character) in document.chars_from(CharPos(line_start)) {
+        if position.0 >= content.end.0 {
+            break;
+        }
+        let display_end = column + display_width(character, column);
+        if display_end <= col_offset {
+            column = display_end;
+            viewport_start_char_index += 1;
+            continue;
+        }
+        if column >= viewport_end {
+            break;
+        }
+        if scratch.line.is_empty() {
+            viewport_start_column = column;
+        }
+        scratch.line.push(character);
+        column = display_end;
+    }
 
     let mut painter = RowPainter::new(writer, &mut scratch.run);
-    let mut column = start.column;
+    let mut column = viewport_start_column;
     let mut range_cursor = 0usize;
-    for (offset, character) in scratch.line[start.byte..].chars().enumerate() {
+    for (offset, character) in scratch.line.chars().enumerate() {
         let display_start = column;
         if display_start >= viewport_end {
             break;
         }
         let display_end = display_start + display_width(character, display_start);
-        let char_index = CharPos(line_start + start.char_index + offset);
+        let char_index = CharPos(line_start + viewport_start_char_index + offset);
         while selection_ranges
             .get(range_cursor)
             .is_some_and(|range| range.end <= char_index)
@@ -342,41 +393,6 @@ impl<'a, W: Write> RowPainter<'a, W> {
     }
 }
 
-/// Where the horizontal viewport begins inside a line.
-struct ViewportStart {
-    /// Byte offset to resume reading from.
-    byte: usize,
-    /// Char index of `byte` within the line.
-    char_index: usize,
-    /// Display column that `byte` sits at.
-    column: usize,
-}
-
-/// Finds the first character whose display columns end past `col_offset`.
-/// When the whole line ends at or before `col_offset` the byte offset is the
-/// end of the line, so the caller draws nothing.
-fn viewport_start(line: &str, col_offset: usize) -> ViewportStart {
-    let mut column = 0;
-    let mut char_index = 0;
-    for (byte, character) in line.char_indices() {
-        let end = column + display_width(character, column);
-        if end > col_offset {
-            return ViewportStart {
-                byte,
-                char_index,
-                column,
-            };
-        }
-        column = end;
-        char_index += 1;
-    }
-    ViewportStart {
-        byte: line.len(),
-        char_index,
-        column,
-    }
-}
-
 fn matching_partner_for_render(app: &App) -> Option<CharPos> {
     if app.editor.mode == Mode::Normal {
         wed::core::matching_partner(&app.editor.document, app.editor.cursor)
@@ -427,7 +443,7 @@ fn safe_text(text: &str, width: usize) -> String {
 mod tests {
     use super::{
         cursor_style_for, display_column, display_width, matching_partner_for_render, paint_line,
-        viewport_start, AppMode, Row, Scratch,
+        AppMode, Row, Scratch,
     };
     use crate::app::App;
     use crossterm::cursor::SetCursorStyle;
@@ -501,20 +517,6 @@ mod tests {
         assert_eq!(display_width('\t', 3), 5);
         assert_eq!(display_column("\tx", 1), 8);
         assert_eq!(display_column("ab\tx", 3), 8);
-    }
-
-    #[test]
-    fn locates_the_viewport_start_inside_a_line() {
-        let start = viewport_start("\tx", 0);
-        assert_eq!((start.byte, start.char_index, start.column), (0, 0, 0));
-        // The tab covers columns 0..8, so column 3 still starts on it.
-        let start = viewport_start("\tx", 3);
-        assert_eq!((start.byte, start.char_index, start.column), (0, 0, 0));
-        let start = viewport_start("\tx", 8);
-        assert_eq!((start.byte, start.char_index, start.column), (1, 1, 8));
-        // Past the end of the line there is nothing left to draw.
-        let start = viewport_start("\tx", 9);
-        assert_eq!((start.byte, start.char_index, start.column), (2, 2, 9));
     }
 
     #[test]

@@ -65,7 +65,7 @@ impl History {
                 edit.start,
                 edit.start.advance(edit.inserted.chars().count()),
             );
-            document.replace_range(current, &edit.removed);
+            document.overwrite_range(current, &edit.removed);
         }
         let cursor = transaction.edits.first().map(|edit| edit.start);
         self.redo_stack.push(transaction);
@@ -79,7 +79,7 @@ impl History {
         for edit in &transaction.edits {
             let current =
                 CharRange::new(edit.start, edit.start.advance(edit.removed.chars().count()));
-            document.replace_range(current, &edit.inserted);
+            document.overwrite_range(current, &edit.inserted);
         }
         let cursor = transaction
             .edits

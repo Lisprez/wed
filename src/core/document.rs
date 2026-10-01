@@ -53,6 +53,13 @@ impl Document {
         removed
     }
 
+    pub fn delete_range_no_return(&mut self, range: CharRange) {
+        let range = range.clamp(self.len_chars());
+        if !range.is_empty() {
+            self.rope.remove(range.start.0..range.end.0);
+        }
+    }
+
     pub fn replace_range(&mut self, range: CharRange, text: &str) -> String {
         let removed = self.slice(range);
         self.overwrite_range(range, text);

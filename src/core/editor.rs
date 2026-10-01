@@ -291,16 +291,19 @@ impl Editor {
             self.message = format!("Pattern not found: {}", needle);
             return 0;
         }
-        let replaced = if global {
-            original.replace(needle, replacement)
-        } else {
-            original.replacen(needle, replacement, 1)
-        };
+        let mut replaced = String::with_capacity(original.len());
+        let mut last_end = 0;
+        for (start, matched) in original.match_indices(needle) {
+            replaced.push_str(&original[last_end..start]);
+            replaced.push_str(replacement);
+            last_end = start + matched.len();
+            if !global {
+                break;
+            }
+        }
+        replaced.push_str(&original[last_end..]);
         let range = CharRange::new(CharPos::ZERO, CharPos(self.document.len_chars()));
         self.history.begin();
-        // `original` is exactly what `range` covers, so hand it straight to the
-        // history instead of letting the edit read the whole document back out
-        // of the rope a second time.
         self.apply_known_edit(range, original, replaced);
         self.history.commit();
         self.cursor = self.cursor.clamp(self.document.len_chars());
@@ -982,7 +985,7 @@ impl Editor {
     fn apply_line_operator(&mut self, operator: Operator, count: usize) {
         let line = self.document.pos_to_line_col(self.cursor).line;
         let last_line = (line + count.saturating_sub(1))
-            .min(document_line_count(&self.document).saturating_sub(1));
+            .min(self.document.line_count().saturating_sub(1));
         let range = CharRange::new(
             self.document.line_start(line),
             self.document.line_end_with_newline(last_line),
@@ -1070,19 +1073,8 @@ impl Editor {
                 self.mode = Mode::Normal;
                 self.selection = None;
             }
-            Operator::Delete => {
-                for range in ranges.iter().rev() {
-                    self.apply_edit(*range, "");
-                }
-                self.cursor = ranges
-                    .first()
-                    .map(|range| range.start)
-                    .unwrap_or(self.cursor);
-                self.mode = Mode::Normal;
-                self.selection = None;
-            }
-            Operator::Change => {
-                if ranges.len() == 1 {
+            Operator::Delete | Operator::Change => {
+                if operator == Operator::Change && ranges.len() == 1 {
                     self.history.begin();
                 }
                 for range in ranges.iter().rev() {
@@ -1092,7 +1084,11 @@ impl Editor {
                     .first()
                     .map(|range| range.start)
                     .unwrap_or(self.cursor);
-                self.mode = Mode::Insert;
+                self.mode = if operator == Operator::Change {
+                    Mode::Insert
+                } else {
+                    Mode::Normal
+                };
                 self.selection = None;
             }
             Operator::IndentLeft | Operator::IndentRight => {
@@ -1141,22 +1137,25 @@ impl Editor {
             self.document.line_start(first_line),
             self.document.line_end_with_newline(last_line),
         );
-        let original = self.document.slice(line_range);
         let mut updated = String::new();
-        for line in original.split_inclusive('\n') {
+        for line in first_line..=last_line {
+            let line_text = self.document.line_text(line);
             if increase {
                 updated.push_str("    ");
-                updated.push_str(line);
+                updated.push_str(&line_text);
             } else {
                 let mut removed = 0;
-                let mut chars = line.chars();
+                let mut chars = line_text.chars();
                 while removed < 4 {
                     match chars.next() {
                         Some(' ') | Some('\t') => removed += 1,
                         _ => break,
                     }
                 }
-                updated.push_str(&line.chars().skip(removed).collect::<String>());
+                updated.push_str(&line_text.chars().skip(removed).collect::<String>());
+            }
+            if line < last_line {
+                updated.push('\n');
             }
         }
         self.apply_edit(line_range, &updated);
@@ -1608,25 +1607,18 @@ fn find_target(
             if skip_adjacent && index > line_start.0 {
                 index -= 1;
             }
-            // Walking backwards one character at a time is what the rope is slow
-            // at, so read the span once and scan it in reverse instead.
-            let mut span = String::new();
-            document.write_slice(
-                CharRange::new(CharPos(line_start.0), CharPos(index + 1)),
-                &mut span,
-            );
             let mut found = 0;
-            let mut offset = index + 1 - line_start.0;
-            for candidate in span.chars().rev() {
-                offset -= 1;
-                let at = line_start.0 + offset;
+            for (at, candidate) in document.chars_before(CharPos(index + 1)) {
+                if at.0 < line_start.0 {
+                    break;
+                }
                 if candidate == character {
                     found += 1;
                     if found == count {
                         if !is_till_find_kind(kind) {
-                            return Some(CharPos(at));
+                            return Some(CharPos(at.0));
                         }
-                        let landing = at + 1;
+                        let landing = at.0 + 1;
                         if landing >= line_end.0 {
                             return None;
                         }
@@ -1639,9 +1631,7 @@ fn find_target(
     }
 }
 
-fn document_line_count(document: &Document) -> usize {
-    document.line_count()
-}
+
 
 #[cfg(test)]
 mod tests {
