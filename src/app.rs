@@ -29,20 +29,9 @@ pub struct App {
 
 impl App {
     pub fn new(path: Option<PathBuf>) -> io::Result<Self> {
-        let editor = if let Some(path) = path.as_ref() {
-            if path.exists() {
-                let text = fs::read_to_string(path).map_err(|error| {
-                    io::Error::new(
-                        error.kind(),
-                        format!("Unable to read {}: {}", path.display(), error),
-                    )
-                })?;
-                Editor::from_text(&text)
-            } else {
-                Editor::new()
-            }
-        } else {
-            Editor::new()
+        let editor = match path.as_ref() {
+            Some(path) if path.exists() => Editor::from_document(read_document(path)?),
+            _ => Editor::new(),
         };
         Ok(Self {
             editor,
@@ -119,19 +108,63 @@ impl App {
                 self.editor.message = format!("Clipboard copy failed: {}", error);
             }
         }
+        self.serve_clipboard_request();
         Ok(match outcome {
             EditorOutcome::Continue => AppOutcome::Continue,
             EditorOutcome::Quit => AppOutcome::Quit,
         })
     }
 
+    /// Performs a clipboard read the editor asked for.
+    ///
+    /// Reading means running an external program, so the editor records the
+    /// intent and waits. A failed read is reported and the document left exactly
+    /// as it was: the plan requires that a selection is only removed once its
+    /// replacement text is actually in hand.
+    fn serve_clipboard_request(&mut self) {
+        if self.editor.clipboard_request().is_none() {
+            return;
+        }
+        match clipboard::get_contents() {
+            Ok(text) => self.editor.supply_clipboard(text),
+            Err(error) => self.editor.report_clipboard_failure(&error.to_string()),
+        }
+    }
+
     pub fn save(&mut self) -> bool {
         self.editor.commit_pending_edit();
-        let Some(path) = self.path.as_ref() else {
+        let Some(path) = self.path.clone() else {
             self.editor.message =
                 "No file name. Use a file path when starting the editor.".to_string();
             return false;
         };
+        if self.write_to(&path) {
+            self.path = Some(path);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Writes the document to `path` atomically and, on success, adopts it as the
+    /// file this buffer belongs to.
+    ///
+    /// Shares one code path with `:w` so the atomic-replace and dirty-tracking
+    /// rules cannot drift apart between the two commands.
+    pub fn save_as(&mut self, path: PathBuf) -> bool {
+        self.editor.commit_pending_edit();
+        if self.write_to(&path) {
+            self.path = Some(path);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Writes to `path` through a temporary file in the same directory, then
+    /// renames over the target, so a failure part way through cannot leave a
+    /// half-written file behind.
+    fn write_to(&mut self, path: &Path) -> bool {
         let temporary = temporary_path(path);
         let result = (|| -> io::Result<()> {
             let mut file = OpenOptions::new()
@@ -193,6 +226,20 @@ impl App {
                 }
             }
             _ => {
+                // `:w path` and `:saveas path` both write and then adopt the new
+                // file, so a later `:w` and `:q` refer to it.
+                if let Some(target) = command
+                    .strip_prefix("saveas ")
+                    .or_else(|| command.strip_prefix("w "))
+                {
+                    let target = target.trim();
+                    if target.is_empty() {
+                        self.editor.message = "Save failed: no file name given".to_string();
+                        return Ok(AppOutcome::Continue);
+                    }
+                    self.save_as(PathBuf::from(target));
+                    return Ok(AppOutcome::Continue);
+                }
                 if let Some(path) = command.strip_prefix("e ") {
                     return match self.open_path(PathBuf::from(path.trim())) {
                         Ok(outcome) => Ok(outcome),
@@ -206,8 +253,16 @@ impl App {
                     self.editor.goto_line(line);
                     return Ok(AppOutcome::Continue);
                 }
-                if let Some((needle, replacement, global)) = parse_substitution(command) {
-                    self.editor.replace_literal(&needle, &replacement, global);
+                if command.starts_with('s') {
+                    // A pattern, so the regex subset applies. A pattern that does
+                    // not parse is reported rather than treated as an unknown
+                    // command, since the user plainly meant a substitution.
+                    match wed::core::Substitution::parse(command) {
+                        Ok(substitution) => {
+                            self.editor.substitute(&substitution);
+                        }
+                        Err(error) => self.editor.message = error,
+                    }
                     return Ok(AppOutcome::Continue);
                 }
                 self.editor.message = format!("Unknown command: {}", command);
@@ -217,13 +272,7 @@ impl App {
     }
 
     fn open_path(&mut self, path: PathBuf) -> io::Result<AppOutcome> {
-        let text = fs::read_to_string(&path).map_err(|error| {
-            io::Error::new(
-                error.kind(),
-                format!("Unable to read {}: {}", path.display(), error),
-            )
-        })?;
-        self.editor.replace_text(&text);
+        self.editor.replace_document(read_document(&path)?);
         self.editor.mark_saved();
         self.path = Some(path.clone());
         self.editor.message = format!("Loaded {}", path.display());
@@ -288,22 +337,67 @@ fn convert_key(key: KeyEvent) -> Key {
     }
 }
 
-fn parse_substitution(command: &str) -> Option<(String, String, bool)> {
-    let body = command.strip_prefix('s')?;
-    let mut characters = body.chars();
-    if characters.next()? != '/' {
-        return None;
+/// Bytes read from the file at a time.
+///
+/// Only affects peak memory during a load, which is what it is for: reading the
+/// whole file into a `String` and handing that to the rope holds two full copies
+/// at once. Streaming through a small buffer holds the rope and one chunk.
+const READ_CHUNK: usize = 1 << 16;
+
+/// Reads `path` into a document.
+///
+/// Rejects invalid UTF-8 explicitly rather than substituting replacement
+/// characters: silently rewriting a user's file on the next save is the kind of
+/// data loss the plan rules out.
+fn read_document(path: &Path) -> io::Result<wed::core::Document> {
+    use std::io::Read;
+
+    let mut file = fs::File::open(path).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("Unable to read {}: {}", path.display(), error),
+        )
+    })?;
+    let mut document = wed::core::Document::new();
+    // A trailing fragment may split a multi-byte character, so it is carried over
+    // rather than decoded on its own.
+    let mut pending: Vec<u8> = Vec::with_capacity(READ_CHUNK);
+    let mut chunk = vec![0u8; READ_CHUNK];
+    loop {
+        let read = file.read(&mut chunk)?;
+        if read == 0 {
+            break;
+        }
+        pending.extend_from_slice(&chunk[..read]);
+        match std::str::from_utf8(&pending) {
+            Ok(text) => {
+                document.append_str(text);
+                pending.clear();
+            }
+            Err(error) if error.error_len().is_none() => {
+                // Incomplete tail: keep it for the next round.
+                let valid = error.valid_up_to();
+                if valid > 0 {
+                    let text = String::from_utf8_lossy(&pending[..valid]).into_owned();
+                    document.append_str(&text);
+                }
+                pending.drain(..valid);
+            }
+            Err(error) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("{} is not valid UTF-8: {}", path.display(), error),
+                ));
+            }
+        }
     }
-    let mut parts = characters.as_str().splitn(2, '/');
-    let needle = parts.next()?.to_string();
-    let remainder = parts.next().unwrap_or("");
-    let mut tail = remainder.splitn(2, '/');
-    let replacement = tail.next().unwrap_or("").to_string();
-    let flags = tail.next().unwrap_or("");
-    if needle.is_empty() || (!flags.is_empty() && flags != "g") {
-        return None;
+    if !pending.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{} ends with an incomplete UTF-8 sequence", path.display()),
+        ));
     }
-    Some((needle, replacement, flags == "g"))
+    Ok(document)
 }
 
 fn temporary_path(path: &Path) -> PathBuf {
@@ -316,9 +410,10 @@ fn temporary_path(path: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{App, AppMode};
+    use super::{App, AppMode, READ_CHUNK};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use std::fs;
+    use std::path::PathBuf;
     use wed::core::{Editor, Key};
 
     fn keys(editor: &mut Editor, keys: &[Key]) {
@@ -379,6 +474,64 @@ mod tests {
         assert_eq!(editor.replace_literal("one", "one", true), 2);
         assert_eq!(editor.text(), "one one");
         assert!(!editor.is_dirty());
+    }
+
+    #[test]
+    fn substitution_patterns_go_through_the_regex_subset() {
+        let mut app = App::new(None).unwrap();
+        app.editor.replace_text("a1 b2 c3");
+        run_command(&mut app, "s/[0-9]/_/g");
+        assert_eq!(app.editor.text(), "a_ b_ c_");
+
+        run_command(&mut app, r"s/^/> /g");
+        assert_eq!(app.editor.text(), "> a_ b_ c_");
+
+        // Undo rewinds the whole substitution.
+        keys(&mut app.editor, &[Key::Char('u')]);
+        assert_eq!(app.editor.text(), "a_ b_ c_");
+    }
+
+    #[test]
+    fn a_malformed_substitution_is_reported_rather_than_ignored() {
+        let mut app = App::new(None).unwrap();
+        app.editor.replace_text("hello");
+        run_command(&mut app, "s/(unclosed/x/");
+        assert!(
+            app.editor.message.starts_with("bad pattern:"),
+            "got {:?}",
+            app.editor.message
+        );
+        assert_eq!(app.editor.text(), "hello", "the document must be untouched");
+
+        run_command(&mut app, "s//x/");
+        assert!(app.editor.message.contains("no pattern"));
+
+        run_command(&mut app, "s/a/b/i");
+        assert!(app.editor.message.contains("unsupported flag"));
+    }
+
+    #[test]
+    fn a_substitution_with_any_delimiter_works() {
+        let mut app = App::new(None).unwrap();
+        // `:` as the delimiter, so the pattern and replacement can both hold a
+        // slash without escaping. A `|` in the pattern means alternation only when
+        // `|` is not itself the delimiter.
+        app.editor.replace_text("path/to/file");
+        run_command(&mut app, "s:to:from:");
+        assert_eq!(app.editor.text(), "path/from/file");
+
+        // With `/` as the delimiter, `|` is alternation.
+        app.editor.replace_text("cat dog");
+        run_command(&mut app, "s/cat|dog/pet/g");
+        assert_eq!(app.editor.text(), "pet pet");
+    }
+
+    #[test]
+    fn an_escaped_delimiter_stays_in_the_pattern() {
+        let mut app = App::new(None).unwrap();
+        app.editor.replace_text("a/b");
+        run_command(&mut app, r"s/a\/b/X/");
+        assert_eq!(app.editor.text(), "X");
     }
 
     #[test]
@@ -458,6 +611,152 @@ mod tests {
         assert_eq!(copied.borrow()[0], "ab");
         app.editor.handle_key(wed::core::Key::Char('p'));
         assert_eq!(app.editor.text(), "abcdab");
+    }
+
+    /// A scratch directory that removes itself.
+    struct Sandbox {
+        directory: PathBuf,
+    }
+
+    impl Sandbox {
+        fn new(tag: &str) -> Self {
+            let mut directory = std::env::temp_dir();
+            directory.push(format!("wed-{tag}-{}", std::process::id()));
+            let _ = fs::remove_dir_all(&directory);
+            fs::create_dir_all(&directory).unwrap();
+            Self { directory }
+        }
+
+        fn path(&self, name: &str) -> PathBuf {
+            self.directory.join(name)
+        }
+    }
+
+    impl Drop for Sandbox {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.directory);
+        }
+    }
+
+    /// Types `command` into the command line and runs it.
+    fn run_command(app: &mut App, command: &str) {
+        let modifiers = KeyModifiers::NONE;
+        app.handle_key(KeyEvent::new(KeyCode::Char(':'), modifiers))
+            .unwrap();
+        for character in command.chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(character), modifiers))
+                .unwrap();
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, modifiers))
+            .unwrap();
+    }
+
+    #[test]
+    fn save_as_writes_the_new_file_and_adopts_it() {
+        let sandbox = Sandbox::new("save-as");
+        let first = sandbox.path("first.txt");
+        let second = sandbox.path("second.txt");
+        fs::write(&first, "original").unwrap();
+
+        let mut app = App::new(Some(first.clone())).unwrap();
+        app.editor.insert_text_for_test("!");
+        assert!(app.save_as(second.clone()));
+        assert_eq!(fs::read_to_string(&second).unwrap(), "!original");
+        assert_eq!(
+            app.path(),
+            Some(second.as_path()),
+            "the buffer follows the file"
+        );
+        assert!(!app.is_dirty(), "a successful save clears the dirty flag");
+
+        // A later plain `:w` must go to the adopted file, not the original.
+        app.editor.insert_text_for_test("?");
+        run_command(&mut app, "w");
+        assert_eq!(fs::read_to_string(&second).unwrap(), "!?original");
+        assert_eq!(fs::read_to_string(&first).unwrap(), "original");
+    }
+
+    #[test]
+    fn w_to_a_path_saves_and_adopts_it() {
+        let sandbox = Sandbox::new("w-path");
+        let target = sandbox.path("target.txt");
+        let mut app = App::new(None).unwrap();
+        app.editor.insert_text_for_test("hello");
+        run_command(&mut app, &format!("w {}", target.display()));
+        assert_eq!(fs::read_to_string(&target).unwrap(), "hello");
+        assert_eq!(app.path(), Some(target.as_path()));
+    }
+
+    #[test]
+    fn save_as_to_an_unwritable_path_reports_the_failure_and_stays_dirty() {
+        let sandbox = Sandbox::new("save-as-fail");
+        let missing = sandbox.path("no-such-directory").join("file.txt");
+        let mut app = App::new(None).unwrap();
+        app.editor.insert_text_for_test("hello");
+        assert!(!app.save_as(missing));
+        assert!(
+            app.editor.message.contains("Save failed"),
+            "got {:?}",
+            app.editor.message
+        );
+        assert!(
+            app.is_dirty(),
+            "a failed save must not clear the dirty flag"
+        );
+        assert!(app.path().is_none(), "the buffer keeps its old file");
+    }
+
+    #[test]
+    fn loading_streams_in_pieces_and_preserves_the_text() {
+        let sandbox = Sandbox::new("stream-load");
+        let path = sandbox.path("big.txt");
+        // Larger than the read chunk, and with multi-byte characters placed so
+        // that some of them straddle a chunk boundary.
+        let mut text = String::new();
+        while text.len() < READ_CHUNK * 3 {
+            text.push_str("héllo 世界 世界\n");
+        }
+        text.push_str("tail without a newline");
+        fs::write(&path, &text).unwrap();
+
+        let app = App::new(Some(path)).unwrap();
+        assert_eq!(app.editor.text(), text);
+        assert_eq!(app.editor.document.len_chars(), text.chars().count());
+    }
+
+    #[test]
+    fn loading_a_file_with_a_multibyte_character_at_a_chunk_boundary_keeps_it() {
+        let sandbox = Sandbox::new("chunk-boundary");
+        let path = sandbox.path("boundary.txt");
+        // Place a three-byte character so its bytes straddle the chunk edge. The read
+        // boundary is at byte 65536, so a character starting at 65534 occupies
+        // 65534, 65535 and 65536: the last byte lands in the next read.
+        let mut text = "a".repeat(READ_CHUNK - 2);
+        text.push('界');
+        text.push_str("tail");
+        assert_eq!(
+            (READ_CHUNK - 2) % 3,
+            2,
+            "the fixture only straddles the boundary when it starts two bytes early"
+        );
+        fs::write(&path, &text).unwrap();
+
+        let app = App::new(Some(path)).unwrap();
+        assert_eq!(app.editor.text(), text);
+    }
+
+    #[test]
+    fn loading_rejects_invalid_utf8_rather_than_substituting_characters() {
+        let sandbox = Sandbox::new("invalid-utf8");
+        let path = sandbox.path("invalid.txt");
+        // A lone continuation byte cannot start a character.
+        fs::write(&path, [b'o', b'k', 0x80, b'\n']).unwrap();
+        let error = match App::new(Some(path)) {
+            Ok(_) => panic!("invalid UTF-8 must not load"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("not valid UTF-8"), "got {error}");
     }
 
     #[test]

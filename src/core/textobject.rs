@@ -1,4 +1,5 @@
 use super::document::Document;
+use super::pairing::{self, PAIR_KINDS};
 use super::position::{CharPos, CharRange};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -69,24 +70,44 @@ pub fn resolve(
     }
 }
 
+/// Half-width, in characters, of the window [`matching_partner_within`] searches.
+///
+/// The bracket highlight is decoration, so past this distance it gives up rather
+/// than walking a whole large document on every cursor move. On an unmatched
+/// delimiter the exact search runs to end of file, which on a 50 MiB document
+/// costs around half a second per frame.
+///
+/// `%` and the pair text objects keep using the exact unbounded search: there a
+/// missing answer would be a behavioural bug rather than a missing decoration,
+/// and neither runs on a per-frame path.
+pub const PARTNER_SCAN_LIMIT: usize = 1 << 16;
+
 pub fn matching_pair(document: &Document, cursor: CharPos) -> Option<CharRange> {
+    matching_pair_within(document, cursor, usize::MAX)
+}
+
+/// [`matching_pair`], but scanning at most `limit` characters in either direction
+/// from `cursor`. Returns `None` when no pair lies inside the window, which for a
+/// bounded `limit` is indistinguishable from there being no pair at all.
+pub fn matching_pair_within(
+    document: &Document,
+    cursor: CharPos,
+    limit: usize,
+) -> Option<CharRange> {
     if document.is_empty() {
         return None;
     }
     let position = cursor.0.min(document.len_chars() - 1);
     if let Some(kind) = pair_kind_at(document.char_at(CharPos(position))) {
-        if let Some((open, close)) = enclosing_pair(document, CharPos(position), kind) {
+        if let Some((open, close)) =
+            pairing::enclosing_pair(document, CharPos(position), kind, limit)
+        {
             return Some(CharRange::new(CharPos(open), CharPos(close + 1)));
         }
     }
-    for kind in [
-        PairKind::Parenthesis,
-        PairKind::Bracket,
-        PairKind::Brace,
-        PairKind::Angle,
-    ] {
+    for kind in PAIR_KINDS {
         if let Some((open, close)) =
-            next_opening_pair(document, CharPos(position.saturating_add(1)), kind)
+            pairing::next_opening_pair(document, CharPos(position.saturating_add(1)), kind, limit)
         {
             return Some(CharRange::new(CharPos(open), CharPos(close + 1)));
         }
@@ -94,7 +115,21 @@ pub fn matching_pair(document: &Document, cursor: CharPos) -> Option<CharRange> 
     None
 }
 
+/// The exact partner position for the bracket highlight, searching the whole
+/// document in both directions.
 pub fn matching_partner(document: &Document, cursor: CharPos) -> Option<CharPos> {
+    matching_partner_within(document, cursor, usize::MAX)
+}
+
+/// [`matching_partner`] restricted to `limit` characters either side of `cursor`.
+///
+/// Callers that run on a per-frame path should prefer this: see
+/// [`PARTNER_SCAN_LIMIT`].
+pub fn matching_partner_within(
+    document: &Document,
+    cursor: CharPos,
+    limit: usize,
+) -> Option<CharPos> {
     if document.is_empty() {
         return None;
     }
@@ -104,7 +139,7 @@ pub fn matching_partner(document: &Document, cursor: CharPos) -> Option<CharPos>
             matching_quote_partner(document, position, document.char_at(CharPos(position))?)
         }
         Some('(' | ')' | '[' | ']' | '{' | '}' | '<' | '>') => {
-            let range = matching_pair(document, CharPos(position))?;
+            let range = matching_pair_within(document, CharPos(position), limit)?;
             if position == range.start.0 {
                 Some(CharPos(range.end.0.saturating_sub(1)))
             } else if position + 1 == range.end.0 {
@@ -285,14 +320,18 @@ fn pair_object(
     kind: PairKind,
     count: usize,
 ) -> Option<CharRange> {
-    let mut pair = enclosing_pair(document, cursor, kind);
+    // A pair text object has to be exact: a missing or truncated answer would delete
+    // or yank the wrong range, so this path searches the whole document.
+    const EXACT: usize = usize::MAX;
+    let mut pair = pairing::enclosing_pair(document, cursor, kind, EXACT);
     if pair.is_none() {
-        let next = next_opening_pair(document, cursor, kind)?;
+        let next = pairing::next_opening_pair(document, cursor, kind, EXACT)?;
         pair = Some(next);
     }
     let (mut open, mut close) = pair?;
     for _ in 1..count {
-        let previous = enclosing_pair(document, CharPos(open.saturating_sub(1)), kind);
+        let previous =
+            pairing::enclosing_pair(document, CharPos(open.saturating_sub(1)), kind, EXACT);
         let Some((previous_open, previous_close)) = previous else {
             break;
         };
@@ -348,8 +387,7 @@ fn tag_object(document: &Document, cursor: CharPos, around: bool) -> Option<Char
             continue;
         }
         if closing {
-            if let Some(stack_index) = stack.iter().rposition(|(open_name, _)| *open_name == name)
-            {
+            if let Some(stack_index) = stack.iter().rposition(|(open_name, _)| *open_name == name) {
                 let (_, open) = stack.remove(stack_index);
                 if cursor.0 >= open && cursor.0 <= end.0 {
                     return Some(if around {
@@ -486,12 +524,17 @@ fn sentence_boundary_at(document: &Document, index: usize, character: char) -> O
     }
 }
 
-fn enclosing_pair(document: &Document, cursor: CharPos, kind: PairKind) -> Option<(usize, usize)> {
-    let (open_character, close_character) = delimiters(kind);
+pub(crate) fn enclosing_pair_scan(
+    document: &Document,
+    cursor: CharPos,
+    kind: PairKind,
+    limit: usize,
+) -> Option<(usize, usize)> {
+    let (open_character, close_character) = delimiters_for(kind);
     let position = cursor.0.min(document.len_chars().saturating_sub(1));
     let mut depth = 0usize;
     let mut open = None;
-    for (at, character) in document.chars_before(CharPos(position + 1)) {
+    for (at, character) in document.chars_before(CharPos(position + 1)).take(limit) {
         let index = at.0;
         if character == close_character && index < position && !is_escaped(document, index) {
             depth += 1;
@@ -506,7 +549,7 @@ fn enclosing_pair(document: &Document, cursor: CharPos, kind: PairKind) -> Optio
     let open = open?;
     let mut depth = 0usize;
     let mut backslashes = 0usize;
-    for (at, character) in document.chars_from(CharPos(open)) {
+    for (at, character) in document.chars_from(CharPos(open)).take(limit) {
         let index = at.0;
         if character == '\\' {
             backslashes += 1;
@@ -526,17 +569,32 @@ fn enclosing_pair(document: &Document, cursor: CharPos, kind: PairKind) -> Optio
     None
 }
 
-fn next_opening_pair(
+/// The earliest opening delimiter at or after `cursor` that starts a balanced
+/// run.
+///
+/// Two phases on purpose: each candidate is measured from its own position with
+/// depth starting at zero, so an unbalanced delimiter earlier in the line does
+/// not hide a balanced pair after it. `"(("` reports the inner pair rather than
+/// failing. A single depth-tracking pass cannot express that, because it counts
+/// from `cursor` and so sees only the outermost run.
+///
+/// On the case that actually costs time -- a document with no delimiter of this
+/// kind -- phase one is already one pass to end of file and phase two never runs,
+/// so there is nothing to win here beyond the `limit`.
+pub(crate) fn next_opening_pair_scan(
     document: &Document,
     cursor: CharPos,
     kind: PairKind,
+    limit: usize,
 ) -> Option<(usize, usize)> {
-    let (open_character, close_character) = delimiters(kind);
+    let (open_character, close_character) = delimiters_for(kind);
     let start = cursor.0.min(document.len_chars());
-    for (at, character) in document.chars_from(CharPos(start)) {
+    for (at, character) in document.chars_from(CharPos(start)).take(limit) {
         let index = at.0;
         if character == open_character && !is_escaped(document, index) {
-            if let Some(close) = matching_close(document, index, open_character, close_character) {
+            if let Some(close) =
+                matching_close(document, index, open_character, close_character, limit)
+            {
                 return Some((index, close));
             }
         }
@@ -549,10 +607,11 @@ fn matching_close(
     open: usize,
     open_character: char,
     close_character: char,
+    limit: usize,
 ) -> Option<usize> {
     let mut depth = 0usize;
     let mut backslashes = 0usize;
-    for (at, character) in document.chars_from(CharPos(open)) {
+    for (at, character) in document.chars_from(CharPos(open)).take(limit) {
         let index = at.0;
         if character == '\\' {
             backslashes += 1;
@@ -582,7 +641,7 @@ fn pair_kind_at(character: Option<char>) -> Option<PairKind> {
     }
 }
 
-fn delimiters(kind: PairKind) -> (char, char) {
+pub(crate) fn delimiters_for(kind: PairKind) -> (char, char) {
     match kind {
         PairKind::Parenthesis => ('(', ')'),
         PairKind::Bracket => ('[', ']'),
@@ -591,7 +650,7 @@ fn delimiters(kind: PairKind) -> (char, char) {
     }
 }
 
-fn is_escaped(document: &Document, index: usize) -> bool {
+pub(crate) fn is_escaped(document: &Document, index: usize) -> bool {
     let mut backslashes = 0usize;
     let mut current = index;
     while current > 0 {
@@ -636,7 +695,10 @@ fn word_kind(character: Option<char>, big: bool) -> WordKind {
 
 #[cfg(test)]
 mod tests {
-    use super::{matching_partner, parse, resolve, PairKind, TextObject};
+    use super::{
+        matching_pair, matching_partner, matching_partner_within, parse, resolve, PairKind,
+        TextObject, PARTNER_SCAN_LIMIT,
+    };
     use crate::core::document::Document;
     use crate::core::position::CharPos;
 
@@ -792,5 +854,72 @@ mod tests {
         assert_eq!(matching_partner(&document, CharPos(4)), Some(CharPos(6)));
         assert_eq!(matching_partner(&document, CharPos(8)), Some(CharPos(10)));
         assert_eq!(matching_partner(&document, CharPos(12)), Some(CharPos(14)));
+    }
+
+    #[test]
+    fn an_unbalanced_delimiter_does_not_hide_a_balanced_pair_after_it() {
+        // The pair is measured from each candidate's own position, so the inner
+        // `()` is still found behind the stray `(`. A single depth-tracking walk
+        // from the start would report nothing here.
+        let document = Document::from_text("(()");
+        assert_eq!(
+            matching_pair(&document, CharPos(0)).map(|r| r.start.0),
+            Some(1)
+        );
+
+        let document = Document::from_text("((x)");
+        assert_eq!(
+            matching_pair(&document, CharPos(0)).map(|r| r.start.0),
+            Some(1)
+        );
+
+        let document = Document::from_text(")(");
+        // No balanced pair at all: the stray `)` opens nothing.
+        assert_eq!(matching_pair(&document, CharPos(0)), None);
+    }
+
+    #[test]
+    fn a_bounded_partner_search_gives_up_past_the_window() {
+        let document = Document::from_text("()");
+        assert_eq!(
+            matching_partner_within(&document, CharPos(0), 64),
+            Some(CharPos(1)),
+            "a partner inside the window is still found"
+        );
+        assert_eq!(
+            matching_partner_within(&document, CharPos(0), 0),
+            None,
+            "a zero-width window finds nothing"
+        );
+
+        // An opening delimiter separated from its partner by more than the
+        // render window: the exact search reports it, a bounded one does not.
+        let gap = PARTNER_SCAN_LIMIT + 4096;
+        let far = format!("({})", "x".repeat(gap));
+        let document = Document::from_text(&far);
+        let open = CharPos(0);
+        assert_eq!(matching_partner(&document, open), Some(CharPos(gap + 1)));
+        assert_eq!(
+            matching_partner_within(&document, open, PARTNER_SCAN_LIMIT),
+            None
+        );
+        // A window just wide enough still finds it.
+        assert_eq!(
+            matching_partner_within(&document, open, gap + 2),
+            Some(CharPos(gap + 1))
+        );
+    }
+
+    #[test]
+    fn the_unbounded_partner_search_is_the_default() {
+        // `matching_partner` must not have picked up the render path's bound, so
+        // it still crosses a gap wider than PARTNER_SCAN_LIMIT.
+        let gap = PARTNER_SCAN_LIMIT + 4096;
+        let far = format!("({})", "x".repeat(gap));
+        let document = Document::from_text(&far);
+        assert_eq!(
+            matching_partner(&document, CharPos(0)),
+            Some(CharPos(gap + 1))
+        );
     }
 }

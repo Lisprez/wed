@@ -61,27 +61,31 @@ pub fn set_contents(text: &str) -> io::Result<()> {
     }
 }
 
-pub fn get_contents() -> String {
+/// Reads the system clipboard.
+///
+/// Reports why a read failed rather than returning an empty string for it: the
+/// editor has to be able to tell "the clipboard is empty" apart from "the
+/// clipboard could not be reached", and only the caller can act on that.
+pub fn get_contents() -> io::Result<String> {
     #[cfg(target_os = "windows")]
     {
-        win32::get_text()
+        Ok(win32::get_text())
     }
 
     #[cfg(target_os = "macos")]
     {
-        get_with_command("pbpaste", &[]).unwrap_or_default()
+        get_with_command("pbpaste", &[])
     }
 
     #[cfg(all(unix, not(target_os = "macos")))]
     {
         get_with_command("wl-paste", &["--no-newline"])
             .or_else(|_| get_with_command("xclip", &["-selection", "clipboard", "-o"]))
-            .unwrap_or_default()
     }
 
     #[cfg(not(any(unix, windows)))]
     {
-        String::new()
+        Err(io::Error::other("system clipboard is not supported"))
     }
 }
 

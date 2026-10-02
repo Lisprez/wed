@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # The four gates from docs/tiny-neovim-development-plan.md section 9.
+  lint-and-test:
+    name: fmt / clippy / test
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - run: cargo test --all-targets
+      - run: cargo build --release
+
+  # Windows only needs to compile: the release artifact is produced there, but
+  # the behaviour is covered by the unit tests on macOS and Linux.
+  windows-build:
+    name: windows compile check
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release
+      - run: cargo test --no-run
+
+  # Benchmarks are not a gate, but a trend is only visible if they run. Kept to
+  # the 1 MiB corpora so the job stays in the tens of seconds; run locally with
+  # WED_BENCH_SCALE=full for the 50 MiB numbers in docs/perf-baseline.md.
+  benchmark:
+    name: benchmark (1 MiB corpora)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run benchmarks
+        run: |
+          cargo bench --bench edit
+          cargo bench --bench render

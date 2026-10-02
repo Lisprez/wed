@@ -1,5 +1,6 @@
 mod app;
 mod render;
+mod width;
 
 use app::{App, AppOutcome};
 use crossterm::{

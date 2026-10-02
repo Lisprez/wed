@@ -8,7 +8,24 @@ build = "build.rs"
 
 [dependencies]
 crossterm = "0.28.1"
+regex = "1.11.1"
 ropey = "1.6.1"
+
+# Benchmarks are hand-rolled (see `benches/harness/mod.rs`) so they can report
+# percentiles without pulling in a statistics dependency.
+[[bench]]
+name = "edit"
+harness = false
+
+[[bench]]
+name = "render"
+harness = false
+
+# Tracks retained bytes with a counting global allocator, so the memory target in
+# the development plan is actually measured rather than assumed.
+[[bench]]
+name = "alloc"
+harness = false
 
 [profile.release]
 opt-level = 3          

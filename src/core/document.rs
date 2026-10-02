@@ -1,9 +1,24 @@
+use super::pairing::PairIndex;
 use super::position::{CharPos, CharRange, LineColumn};
 use ropey::Rope;
+use std::cell::RefCell;
 use std::fmt;
 
 pub struct Document {
     rope: Rope,
+    /// Bumped by every mutating method.
+    ///
+    /// Derived structures cache themselves against this rather than against the
+    /// editor's revision: the document is the thing they describe, so tracking
+    /// its own changes is the only way they cannot end up disagreeing with it.
+    mutation: u64,
+    /// Cached pairing, tagged with the `mutation` it was built from.
+    ///
+    /// Interior mutable because every reader holds `&Document`. Rebuilt on first
+    /// use after any edit rather than maintained: an edit can re-pair an unbounded
+    /// region, so there is no cheap incremental update, and a stale pairing is
+    /// worse than a slow one.
+    pairs: RefCell<Option<(u64, PairIndex)>>,
 }
 
 impl Document {
@@ -14,6 +29,63 @@ impl Document {
     pub fn from_text(text: &str) -> Self {
         Self {
             rope: Rope::from_str(text),
+            mutation: 1,
+            pairs: RefCell::new(None),
+        }
+    }
+
+    /// An empty document that text can be appended to.
+    pub fn empty() -> Self {
+        Self {
+            rope: Rope::new(),
+            mutation: 1,
+            pairs: RefCell::new(None),
+        }
+    }
+
+    /// The value that changes whenever the text does.
+    pub fn mutation(&self) -> u64 {
+        self.mutation
+    }
+
+    fn changed(&mut self) {
+        self.mutation = self.mutation.wrapping_add(1);
+        // Dropping the cache is cheaper than letting `pair_index` compare
+        // generations, and it releases the memory while the text is being changed.
+        self.pairs = RefCell::new(None);
+    }
+
+    /// Discards the cached pairing, forcing a rebuild on next use.
+    ///
+    /// Nothing in the editor needs this: every edit goes through the methods
+    /// above, which drop the cache themselves. It exists so a caller that has
+    /// changed the text by another route can still force the pairing to follow.
+    pub fn invalidate_pair_index(&self) {
+        *self.pairs.borrow_mut() = None;
+    }
+
+    /// The delimiter pairing for the current text, building it if needed.
+    pub fn pair_index(&self) -> std::cell::Ref<'_, PairIndex> {
+        if !self
+            .pairs
+            .borrow()
+            .as_ref()
+            .is_some_and(|(tag, _)| *tag == self.mutation)
+        {
+            *self.pairs.borrow_mut() = Some((self.mutation, PairIndex::build(self)));
+        }
+        std::cell::Ref::map(self.pairs.borrow(), |cached| {
+            &cached.as_ref().expect("just populated").1
+        })
+    }
+
+    /// Appends `text` to the end.
+    ///
+    /// Lets a file be loaded a piece at a time, so the whole of it never has to
+    /// be held as one contiguous `String` alongside the rope.
+    pub fn append_str(&mut self, text: &str) {
+        if !text.is_empty() {
+            self.rope.append(Rope::from_str(text));
         }
     }
 
@@ -41,6 +113,7 @@ impl Document {
     pub fn insert_str(&mut self, pos: CharPos, text: &str) {
         if !text.is_empty() {
             self.rope.insert(pos.clamp(self.len_chars()).0, text);
+            self.changed();
         }
     }
 
@@ -49,6 +122,7 @@ impl Document {
         let removed = self.slice(range);
         if !range.is_empty() {
             self.rope.remove(range.start.0..range.end.0);
+            self.changed();
         }
         removed
     }
@@ -57,6 +131,7 @@ impl Document {
         let range = range.clamp(self.len_chars());
         if !range.is_empty() {
             self.rope.remove(range.start.0..range.end.0);
+            self.changed();
         }
     }
 
@@ -70,11 +145,17 @@ impl Document {
     /// matters when `range` covers a whole document.
     pub fn overwrite_range(&mut self, range: CharRange, text: &str) {
         let range = range.clamp(self.len_chars());
+        let mut changed = false;
         if !range.is_empty() {
             self.rope.remove(range.start.0..range.end.0);
+            changed = true;
         }
         if !text.is_empty() {
             self.rope.insert(range.start.0, text);
+            changed = true;
+        }
+        if changed {
+            self.changed();
         }
     }
 
@@ -85,6 +166,16 @@ impl Document {
             out.write_all(chunk.as_bytes())?;
         }
         Ok(())
+    }
+
+    /// True when the text ends with a line break.
+    ///
+    /// The last line of a file that does not is special: there is no line after
+    /// it for a linewise paste to land on, which is why this is worth asking
+    /// rather than inferring from a line count.
+    pub fn ends_with_newline(&self) -> bool {
+        let length = self.len_chars();
+        length > 0 && self.rope.char(length - 1) == '\n'
     }
 
     pub fn line_count(&self) -> usize {

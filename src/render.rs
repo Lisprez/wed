@@ -9,11 +9,8 @@ use std::io::{self, BufWriter, Write};
 use std::rc::Rc;
 use wed::core::{CharPos, CharRange, Document, LineColumn, Mode, Selection};
 
-const TAB_STOP: usize = 8;
-/// Spaces emitted for a (possibly clipped) tab; a tab never covers more
-/// than one tab stop, so slicing this avoids a per-tab allocation.
-const TAB_SPACES: &str = "        ";
-/// Padding for the status line; sliced instead of `" ".repeat(n)`.
+/// Padding for the status line, and for tabs and clipped multi-cell glyphs
+/// within a row; sliced instead of `" ".repeat(n)`.
 const PAD_SPACES: [u8; 4096] = [b' '; 4096];
 
 fn pad_spaces(n: usize) -> &'static str {
@@ -24,7 +21,7 @@ fn pad_spaces(n: usize) -> &'static str {
 
 /// Buffer reused across frames so painting a row does not allocate.
 #[derive(Default)]
-struct Scratch {
+pub(crate) struct Scratch {
     /// Accumulates one run of same-styled glyphs before they are printed.
     run: String,
 }
@@ -38,7 +35,7 @@ pub struct Renderer {
     scratch: Scratch,
     cached_cursor_display: Option<(CharPos, u64, usize)>,
     cached_selection_ranges: Option<(Option<Selection>, u64, Rc<[CharRange]>)>,
-    cached_matching_partner: Option<(CharPos, u64, Option<CharPos>)>,
+    cached_matching_partner: Option<(CharPos, u64, Mode, Option<CharPos>)>,
 }
 
 impl Renderer {
@@ -86,7 +83,7 @@ impl Renderer {
                 cached_display
             }
             _ => {
-                let display = self.cursor_display_column(document, cursor);
+                let display = cursor_display_column(document, cursor);
                 self.cached_cursor_display = Some((editor.cursor, revision, display));
                 display
             }
@@ -123,14 +120,17 @@ impl Renderer {
             }
         };
         let matching_partner = match self.cached_matching_partner {
-            Some((cached_cursor, cached_revision, cached_partner))
-                if cached_cursor == editor.cursor && cached_revision == revision =>
+            Some((cached_cursor, cached_revision, cached_mode, cached_partner))
+                if cached_cursor == editor.cursor
+                    && cached_revision == revision
+                    && cached_mode == editor.mode =>
             {
                 cached_partner
             }
             _ => {
                 let partner = matching_partner_for_render(app);
-                self.cached_matching_partner = Some((editor.cursor, revision, partner));
+                self.cached_matching_partner =
+                    Some((editor.cursor, revision, editor.mode, partner));
                 partner
             }
         };
@@ -178,19 +178,6 @@ impl Renderer {
         )?;
         self.writer.flush()?;
         Ok(())
-    }
-
-    /// Display column of `location.column` within its own line.
-    ///
-    /// Computed straight from the rope without materialising the line, so a
-    /// long line costs O(cursor column) rather than O(line length).
-    fn cursor_display_column(&self, document: &Document, location: LineColumn) -> usize {
-        let start = document.line_start(location.line);
-        let mut column = 0;
-        for (_, character) in document.chars_from(start).take(location.column) {
-            column += display_width(character, column);
-        }
-        column
     }
 
     fn render_status(
@@ -280,13 +267,13 @@ impl Renderer {
 }
 
 /// Everything needed to paint one row of the viewport.
-struct Row<'a> {
-    document: &'a Document,
-    file_row: usize,
-    col_offset: usize,
-    text_width: usize,
-    selection_ranges: &'a [CharRange],
-    matching_partner: Option<CharPos>,
+pub(crate) struct Row<'a> {
+    pub(crate) document: &'a Document,
+    pub(crate) file_row: usize,
+    pub(crate) col_offset: usize,
+    pub(crate) text_width: usize,
+    pub(crate) selection_ranges: &'a [CharRange],
+    pub(crate) matching_partner: Option<CharPos>,
 }
 
 /// Paints one document line into the horizontal window
@@ -295,7 +282,11 @@ struct Row<'a> {
 /// Only the characters that can be seen are touched: the line is walked from its
 /// start far enough to reach `col_offset`, then until the right edge, so the cost
 /// depends on the viewport rather than on the length of the line.
-fn paint_line<W: Write>(writer: &mut W, row: Row<'_>, scratch: &mut Scratch) -> io::Result<()> {
+pub(crate) fn paint_line<W: Write>(
+    writer: &mut W,
+    row: Row<'_>,
+    scratch: &mut Scratch,
+) -> io::Result<()> {
     let Row {
         document,
         file_row,
@@ -324,13 +315,21 @@ fn paint_line<W: Write>(writer: &mut W, row: Row<'_>, scratch: &mut Scratch) -> 
             break;
         }
         let display_start = column;
-        let display_end = display_start + display_width(character, display_start);
+        let cells = display_width(character, display_start);
+        let display_end = display_start + cells;
         if display_end <= col_offset {
             column = display_end;
             continue;
         }
         if display_start >= viewport_end {
             break;
+        }
+        // A zero-cell character that has been scrolled past is skipped with the
+        // rest of the line: emitting it would put a glyph in a cell it does not
+        // own.
+        if cells == 0 && display_start <= col_offset {
+            column = display_end;
+            continue;
         }
         while selection_ranges
             .get(range_cursor)
@@ -348,15 +347,22 @@ fn paint_line<W: Write>(writer: &mut W, row: Row<'_>, scratch: &mut Scratch) -> 
         } else {
             None
         };
+        // Clip by cell, not by character. The part of `character` inside the
+        // viewport is `[visible_start, visible_end)` of the row.
+        let visible_start = display_start.max(col_offset);
+        let visible_end = display_end.min(viewport_end);
+        let visible_cells = visible_end.saturating_sub(visible_start);
         if character == '\t' {
-            let visible_start = display_start.max(col_offset);
-            let visible_end = display_end.min(viewport_end);
-            painter.push(
-                &TAB_SPACES[..visible_end.saturating_sub(visible_start)],
-                style,
-            )?;
-        } else {
+            // A tab is nothing but its expansion, so every visible cell is a
+            // space. It never covers more than one tab stop.
+            painter.push(pad_spaces(visible_cells), style)?;
+        } else if visible_cells == cells {
             painter.push(safe_character(character).encode_utf8(&mut [0u8; 4]), style)?;
+        } else {
+            // Only part of a multi-cell glyph is on screen. Half a glyph has no
+            // meaning to the terminal and drawing it would leave every later
+            // column misaligned, so the visible cells become spaces.
+            painter.push(pad_spaces(visible_cells), style)?;
         }
         column = display_end;
     }
@@ -414,9 +420,19 @@ impl<'a, W: Write> RowPainter<'a, W> {
     }
 }
 
-fn matching_partner_for_render(app: &App) -> Option<CharPos> {
+/// Exposed for the viewport benchmark in `benches/render.rs`.
+///
+/// Bounded deliberately: this runs on every frame whose cursor moved, and the
+/// exact search runs to end of file whenever the delimiter under the cursor is
+/// unmatched. On a large document that is the most expensive thing the editor
+/// does, and it buys a decoration.
+pub(crate) fn matching_partner_for_render(app: &App) -> Option<CharPos> {
     if app.editor.mode == Mode::Normal {
-        wed::core::matching_partner(&app.editor.document, app.editor.cursor)
+        wed::core::matching_partner_within(
+            &app.editor.document,
+            app.editor.cursor,
+            wed::core::PARTNER_SCAN_LIMIT,
+        )
     } else {
         None
     }
@@ -432,12 +448,25 @@ fn cursor_style_for(app_mode: AppMode, mode: Mode) -> SetCursorStyle {
     }
 }
 
-fn display_width(character: char, column: usize) -> usize {
-    if character == '\t' {
-        TAB_STOP - (column % TAB_STOP)
-    } else {
-        1
+pub(crate) fn display_width(character: char, column: usize) -> usize {
+    crate::width::width(character, column)
+}
+
+/// Display column of `location.column` within its own line.
+///
+/// Computed straight from the rope without materialising the line, so a long
+/// line costs O(cursor column) rather than O(line length).
+///
+/// A free function rather than a `Renderer` method: it reads no renderer state,
+/// which lets the viewport benchmark in `benches/render.rs` call it without
+/// standing up a terminal, and that needs a TTY.
+pub(crate) fn cursor_display_column(document: &Document, location: LineColumn) -> usize {
+    let start = document.line_start(location.line);
+    let mut column = 0;
+    for (_, character) in document.chars_from(start).take(location.column) {
+        column += display_width(character, column);
     }
+    column
 }
 
 #[cfg(test)]
@@ -464,12 +493,12 @@ fn safe_text(text: &str, width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        cursor_style_for, display_column, display_width, matching_partner_for_render, paint_line,
-        AppMode, Row, Scratch,
+        cursor_display_column, cursor_style_for, display_column, display_width,
+        matching_partner_for_render, paint_line, AppMode, Row, Scratch,
     };
     use crate::app::App;
     use crossterm::cursor::SetCursorStyle;
-    use wed::core::{CharPos, CharRange, Document, Mode, SelectionKind};
+    use wed::core::{CharPos, CharRange, Document, LineColumn, Mode, SelectionKind};
 
     /// Bytes crossterm emits for the matching-partner colours.
     const YELLOW_BACKGROUND: &str = "\x1b[48;5;11m";
@@ -606,5 +635,80 @@ mod tests {
         assert_eq!(matching_partner_for_render(&app), Some(CharPos(2)));
         app.editor.mode = Mode::Visual(SelectionKind::Characterwise);
         assert_eq!(matching_partner_for_render(&app), None);
+    }
+
+    #[test]
+    fn wide_characters_occupy_two_cells() {
+        assert_eq!(display_width('世', 0), 2);
+        assert_eq!(display_width('a', 0), 1);
+        assert_eq!(
+            display_width('世', 1),
+            2,
+            "width does not depend on the column"
+        );
+        // Combining marks add nothing, so the column after one is unchanged.
+        assert_eq!(display_width('\u{0301}', 4), 0);
+        assert_eq!(display_column("e\u{0301}x", 3), 2);
+    }
+
+    #[test]
+    fn paints_wide_characters_at_two_cells_each() {
+        assert_eq!(paint("世界\n", 0, 0, 80, &[], None), "世界");
+        assert_eq!(paint("a世b\n", 0, 0, 80, &[], None), "a世b");
+    }
+
+    #[test]
+    fn clips_a_wide_character_at_the_right_edge_instead_of_drawing_half_of_it() {
+        // 世 covers cells 0..=1. Showing only cell 1 has to produce a space,
+        // because a lone half glyph would leave every later column misaligned.
+        assert_eq!(paint("世x\n", 0, 1, 1, &[], None), " ");
+        // Both cells visible: the glyph itself.
+        assert_eq!(paint("世x\n", 0, 0, 2, &[], None), "世");
+        // Entirely scrolled past.
+        assert_eq!(paint("世x\n", 0, 2, 4, &[], None), "x");
+    }
+
+    #[test]
+    fn clips_a_wide_character_at_the_left_edge() {
+        // "世界" covers cells 0..=1 and 2..=3. A window of [1, 4) catches one
+        // cell of 世 and both of 界.
+        assert_eq!(paint("世界\n", 0, 1, 3, &[], None), " 界");
+    }
+
+    #[test]
+    fn mixing_wide_and_narrow_characters_keeps_the_right_edge_exact() {
+        // "a世b" is cells: a=0, 世=1..=2, b=3. A two-cell window from column 1
+        // holds the whole of 世 and nothing of b.
+        assert_eq!(paint("a世b\n", 0, 1, 2, &[], None), "世");
+        assert_eq!(paint("a世b\n", 0, 2, 2, &[], None), " b");
+    }
+
+    #[test]
+    fn cursor_display_column_counts_cells_not_characters() {
+        let document = Document::from_text("世界ab\ncd\n");
+        // After 世 (2 cells) + 界 (2 cells) + a + b the column is 6, not 4.
+        assert_eq!(
+            cursor_display_column(&document, LineColumn { line: 0, column: 4 }),
+            6
+        );
+        assert_eq!(
+            cursor_display_column(&document, LineColumn { line: 0, column: 1 }),
+            2
+        );
+        assert_eq!(
+            cursor_display_column(&document, LineColumn { line: 1, column: 2 }),
+            2
+        );
+    }
+
+    #[test]
+    fn a_combining_mark_does_not_shift_the_cursor() {
+        // "é" as e + combining acute is one cell, so the cursor after it sits
+        // at column 1 whether the mark is there or not.
+        let document = Document::from_text("e\u{0301}x\n");
+        assert_eq!(
+            cursor_display_column(&document, LineColumn { line: 0, column: 2 }),
+            1
+        );
     }
 }
