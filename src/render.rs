@@ -26,19 +26,41 @@ pub(crate) struct Scratch {
     run: String,
 }
 
-pub struct Renderer {
-    writer: BufWriter<io::Stdout>,
+pub struct Renderer<W: Write = io::Stdout> {
+    writer: BufWriter<W>,
     width: u16,
     height: u16,
     row_offset: usize,
     col_offset: usize,
     scratch: Scratch,
     cached_cursor_display: Option<(CharPos, u64, usize)>,
+    cached_visible_message: Option<(String, usize, String)>,
     cached_selection_ranges: Option<(Option<Selection>, u64, Rc<[CharRange]>)>,
+    painted_partner: Option<CharPos>,
     cached_matching_partner: Option<(CharPos, u64, Mode, Option<CharPos>)>,
+    last_frame: Option<FrameKey>,
 }
 
-impl Renderer {
+/// Everything that can change what a frame looks like. When none of it moved
+/// since the last frame there is nothing to repaint, so the whole paint is
+/// skipped.
+#[derive(Clone, PartialEq)]
+struct FrameKey {
+    revision: u64,
+    cursor: CharPos,
+    mode: Mode,
+    app_mode: AppMode,
+    selection: Option<Selection>,
+    row_offset: usize,
+    col_offset: usize,
+    width: u16,
+    height: u16,
+    message: String,
+    search_prompt: String,
+    command_prompt: String,
+}
+
+impl Renderer<io::Stdout> {
     pub fn new() -> io::Result<Self> {
         let (width, height) = size()?;
         Ok(Self {
@@ -49,9 +71,33 @@ impl Renderer {
             col_offset: 0,
             scratch: Scratch::default(),
             cached_cursor_display: None,
+            cached_visible_message: None,
+            cached_selection_ranges: None,
+            painted_partner: None,
+            cached_matching_partner: None,
+            last_frame: None,
+        })
+    }
+}
+
+impl<W: Write> Renderer<W> {
+    /// Builds a renderer writing to `writer` rather than stdout, with an
+    /// explicitly-sized viewport. The benchmark uses this to capture frames.
+    pub fn with_writer(writer: W, width: u16, height: u16) -> Self {
+        Self {
+            writer: BufWriter::with_capacity(1 << 16, writer),
+            width,
+            height,
+            row_offset: 0,
+            col_offset: 0,
+            scratch: Scratch::default(),
+            cached_cursor_display: None,
+            cached_visible_message: None,
             cached_selection_ranges: None,
             cached_matching_partner: None,
-        })
+            painted_partner: None,
+            last_frame: None,
+        }
     }
 
     pub fn resize(&mut self, width: u16, height: u16) {
@@ -64,7 +110,6 @@ impl Renderer {
     }
 
     pub fn render(&mut self, app: &App) -> io::Result<()> {
-        queue!(self.writer, Hide)?;
         let text_height = (self.height as usize).saturating_sub(2);
         let text_width = self.width as usize;
         if text_height == 0 || text_width == 0 {
@@ -101,6 +146,56 @@ impl Renderer {
             self.col_offset = cursor_display_column - text_width + 1;
         }
 
+        let frame_key = FrameKey {
+            revision,
+            cursor: editor.cursor,
+            mode: editor.mode,
+            app_mode: app.mode(),
+            selection: editor.selection.clone(),
+            row_offset: self.row_offset,
+            col_offset: self.col_offset,
+            width: self.width,
+            height: self.height,
+            message: editor.message.clone(),
+            search_prompt: app
+                .editor
+                .search_prompt()
+                .unwrap_or_default()
+                .to_string(),
+            command_prompt: app.command_prompt().unwrap_or_default().to_string(),
+        };
+        if self.last_frame.as_ref() == Some(&frame_key) {
+            // Cursor visibility unchanged; nothing to redraw, so do not even
+            // re-hide it -- hiding and walking away would leave it hidden.
+            return Ok(());
+        }
+        queue!(self.writer, Hide)?;
+        let old_selection = self
+            .cached_selection_ranges
+            .as_ref()
+            .and_then(|cached| cached.0.clone());
+        let old_partner_line: Option<usize> = self
+            .painted_partner
+            .map(|pos| document.pos_to_line_col(pos).line);
+        let dirty = editor.take_dirty_lines();
+        let revision_changed = self
+            .last_frame
+            .as_ref()
+            .is_none_or(|prev| prev.revision != revision);
+        let offsets_changed = self.last_frame.as_ref().is_none_or(|prev| {
+            (prev.row_offset, prev.col_offset, prev.width, prev.height)
+                != (self.row_offset, self.col_offset, self.width, self.height)
+        });
+        let cursor_moved = self
+            .last_frame
+            .as_ref()
+            .is_none_or(|prev| prev.cursor != editor.cursor);
+        let mode_changed = self.last_frame.as_ref().is_none_or(|prev| {
+            (prev.mode, prev.app_mode) != (editor.mode, app.mode())
+        });
+        let selection_changed = old_selection != editor.selection;
+        let prev_cursor = self.last_frame.as_ref().map(|prev| prev.cursor);
+        let prev_selection = old_selection;
         let selection_ranges: Rc<[CharRange]> = match &self.cached_selection_ranges {
             Some((cached_selection, cached_revision, ranges))
                 if *cached_selection == editor.selection && *cached_revision == revision =>
@@ -134,33 +229,116 @@ impl Renderer {
                 partner
             }
         };
-        for screen_row in 0..text_height {
-            let file_row = self.row_offset + screen_row;
-            queue!(
-                self.writer,
-                MoveTo(0, screen_row as u16),
-                Clear(ClearType::CurrentLine)
-            )?;
-            if file_row < document.line_count() {
-                paint_line(
-                    &mut self.writer,
-                    Row {
-                        document,
-                        file_row,
-                        col_offset: self.col_offset,
-                        text_width,
-                        selection_ranges: &selection_ranges[..],
-                        matching_partner,
-                    },
-                    &mut self.scratch,
-                )?;
-            } else {
+        let full_paint = self.last_frame.is_none()
+            || offsets_changed
+            || (revision_changed && dirty.full);
+        if full_paint {
+            for screen_row in 0..text_height {
+                let file_row = self.row_offset + screen_row;
                 queue!(
                     self.writer,
-                    SetForegroundColor(Color::DarkGrey),
-                    Print("~"),
-                    ResetColor
+                    MoveTo(0, screen_row as u16),
+                    Clear(ClearType::CurrentLine)
                 )?;
+                if file_row < document.line_count() {
+                    paint_line(
+                        &mut self.writer,
+                        Row {
+                            document,
+                            file_row,
+                            col_offset: self.col_offset,
+                            text_width,
+                            selection_ranges: &selection_ranges[..],
+                            matching_partner,
+                        },
+                        &mut self.scratch,
+                    )?;
+                } else {
+                    queue!(
+                        self.writer,
+                        SetForegroundColor(Color::DarkGrey),
+                        Print("~"),
+                        ResetColor
+                    )?;
+                }
+            }
+        } else {
+            // Only the rows whose content, highlight, or cursor cell changed.
+            let mut rows: Vec<usize> = Vec::new();
+            let add_row = |rows: &mut Vec<usize>, row: usize| {
+                if row >= self.row_offset
+                    && row < self.row_offset + text_height
+                    && !rows.contains(&row)
+                {
+                    rows.push(row);
+                }
+            };
+            if revision_changed {
+                if let Some((first, last)) = dirty.lines {
+                    for row in first..=last {
+                        add_row(&mut rows, row);
+                    }
+                }
+            }
+            if selection_changed {
+                for selection in [prev_selection.as_ref(), editor.selection.as_ref()] {
+                    if let Some(selection) = selection {
+                        for range in selection.ranges(document) {
+                            let first = document.pos_to_line_col(range.start).line;
+                            let last = document
+                                .pos_to_line_col(CharPos(range.end.0.saturating_sub(1)))
+                                .line;
+                            for row in first..=last {
+                                add_row(&mut rows, row);
+                            }
+                        }
+                    }
+                }
+            }
+            if cursor_moved || mode_changed || revision_changed {
+                if let Some(previous) = prev_cursor {
+                    let row = document.pos_to_line_col(previous).line;
+                    add_row(&mut rows, row);
+                }
+                let row = document.pos_to_line_col(editor.cursor).line;
+                add_row(&mut rows, row);
+                if let Some(row) = old_partner_line {
+                    add_row(&mut rows, row);
+                }
+                if let Some(pos) = matching_partner {
+                    let row = document.pos_to_line_col(pos).line;
+                    add_row(&mut rows, row);
+                }
+            }
+            rows.sort_unstable();
+            for row in rows {
+                let screen_row = (row - self.row_offset) as u16;
+                queue!(
+                    self.writer,
+                    MoveTo(0, screen_row),
+                    Clear(ClearType::CurrentLine)
+                )?;
+                if row < document.line_count() {
+                    paint_line(
+                        &mut self.writer,
+                        Row {
+                            document,
+                            file_row: row,
+                            col_offset: self.col_offset,
+                            text_width,
+                            selection_ranges: &selection_ranges[..],
+                            matching_partner,
+                        },
+                        &mut self.scratch,
+                    )?;
+                } else {
+                    queue!(
+                        self.writer,
+                        SetForegroundColor(Color::DarkGrey),
+                        Print("~"),
+                        ResetColor
+                    )?;
+                }
             }
         }
 
@@ -177,6 +355,8 @@ impl Renderer {
             Show
         )?;
         self.writer.flush()?;
+        self.last_frame = Some(frame_key);
+        self.painted_partner = matching_partner;
         Ok(())
     }
 
@@ -188,10 +368,7 @@ impl Renderer {
     ) -> io::Result<()> {
         let row = self.height.saturating_sub(2);
         queue!(self.writer, MoveTo(0, row), Clear(ClearType::CurrentLine))?;
-        let filename = app
-            .path()
-            .map(|path| path.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "[No Name]".to_string());
+        let filename = app.filename();
         let dirty = if app.is_dirty() { "[+]" } else { "" };
         let left = format!(" wed - {}{} ", filename, dirty);
         let right = format!(" Line: {}, Col: {} ", location.line + 1, display_column + 1);
@@ -235,27 +412,36 @@ impl Renderer {
     fn render_message(&mut self, app: &App) -> io::Result<()> {
         let row = self.height.saturating_sub(1);
         queue!(self.writer, MoveTo(0, row), Clear(ClearType::CurrentLine))?;
-        let owned;
         let (message, color) = if app.mode() == AppMode::QuitPrompt {
             ("Unsaved changes! Save first? (y/n/c)", Color::Red)
         } else if app.mode() == AppMode::CommandLine {
-            owned = app.command_prompt().unwrap_or_else(|| ":".to_string());
-            (&owned[..], Color::Cyan)
+            (app.command_prompt().unwrap_or(":"), Color::Cyan)
         } else {
             match app.editor.mode {
-                Mode::Search => {
-                    owned = app
-                        .editor
+                Mode::Search => (
+                    app.editor
                         .search_prompt()
-                        .unwrap_or_else(|| app.editor.message.clone());
-                    (&owned[..], Color::Yellow)
-                }
+                        .unwrap_or(&app.editor.message[..]),
+                    Color::Yellow,
+                ),
                 Mode::Insert => (&app.editor.message[..], Color::Green),
                 Mode::CommandLine => (&app.editor.message[..], Color::Cyan),
                 _ => (&app.editor.message[..], Color::White),
             }
         };
-        let visible = safe_text(message, self.width as usize);
+        let width = self.width as usize;
+        let visible = match &self.cached_visible_message {
+            Some((cached_raw, cached_width, cached_visible))
+                if cached_raw == message && *cached_width == width =>
+            {
+                cached_visible.clone()
+            }
+            _ => {
+                let recomputed = safe_text(message, width);
+                self.cached_visible_message = Some((message.to_string(), width, recomputed.clone()));
+                recomputed
+            }
+        };
         queue!(
             self.writer,
             SetForegroundColor(color),
@@ -428,13 +614,29 @@ impl<'a, W: Write> RowPainter<'a, W> {
 /// does, and it buys a decoration.
 pub(crate) fn matching_partner_for_render(app: &App) -> Option<CharPos> {
     if app.editor.mode == Mode::Normal {
-        wed::core::matching_partner_within(
-            &app.editor.document,
-            app.editor.cursor,
-            wed::core::PARTNER_SCAN_LIMIT,
-        )
+        // When the pair index is already current, matching via it is an O(1)
+        // query and costs nothing per frame. Otherwise fall back to the
+        // bounded scan: a cold index would cost a full document pass here,
+        // and this path runs on every frame whose cursor moved.
+        if app.editor.document.pair_index_warm() {
+            wed::core::matching_partner(&app.editor.document, app.editor.cursor)
+        } else {
+            wed::core::matching_partner_within(
+                &app.editor.document,
+                app.editor.cursor,
+                wed::core::PARTNER_SCAN_LIMIT,
+            )
+        }
     } else {
         None
+    }
+}
+
+impl Renderer<Vec<u8>> {
+    /// Bytes written to the sink so far. The sink only advances after
+    /// `render` flushes, so it reflects whole frames.
+    pub fn sink_len(&self) -> usize {
+        self.writer.get_ref().len()
     }
 }
 

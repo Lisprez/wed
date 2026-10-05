@@ -75,28 +75,68 @@ impl PairIndex {
         let mut stacks: [Vec<usize>; PAIR_KINDS.len()] = Default::default();
 
         let mut backslashes = 0usize;
-        for (position, character) in document.chars_from(CharPos::ZERO) {
-            if character == '\\' {
-                backslashes += 1;
-                continue;
-            }
-            let escaped = backslashes % 2 == 1;
-            backslashes = 0;
-            if escaped {
-                continue;
-            }
-            for (index, kind) in PAIR_KINDS.iter().enumerate() {
-                let (open_character, close_character) = delimiters_for(*kind);
-                if character == open_character {
-                    opens[index].push(position.0);
-                    close_of[index].push(UNMATCHED);
-                    stacks[index].push(opens[index].len() - 1);
-                } else if character == close_character {
-                    if let Some(open_index) = stacks[index].pop() {
-                        close_of[index][open_index] = position.0;
+        let mut chunk_byte_start = 0usize;
+        let mut chunk_char_start = 0usize;
+        for chunk in document.rope().chunks() {
+            if chunk.is_ascii() {
+                // ASCII bytes map one-to-one onto chars, and no multi-byte
+                // UTF-8 sequence can contain a delimiter byte, so a byte scan
+                // sees exactly the delimiter chars a char scan would.
+                for (offset, byte) in chunk.as_bytes().iter().enumerate() {
+                    let position = chunk_char_start + offset;
+                    match *byte {
+                        b'\\' => backslashes += 1,
+                        byte => {
+                            let escaped = backslashes % 2 == 1;
+                            backslashes = 0;
+                            if escaped {
+                                continue;
+                            }
+                            for (index, kind) in PAIR_KINDS.iter().enumerate() {
+                                let (open_character, close_character) = delimiters_for(*kind);
+                                if byte == open_character as u8 {
+                                    opens[index].push(position);
+                                    close_of[index].push(UNMATCHED);
+                                    stacks[index].push(opens[index].len() - 1);
+                                } else if byte == close_character as u8 {
+                                    if let Some(open_index) = stacks[index].pop() {
+                                        close_of[index][open_index] = position;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                for (offset, character) in chunk.chars().enumerate() {
+                    let position = chunk_char_start + offset;
+                    if character == '\\' {
+                        backslashes += 1;
+                        continue;
+                    }
+                    let escaped = backslashes % 2 == 1;
+                    backslashes = 0;
+                    if escaped {
+                        continue;
+                    }
+                    for (index, kind) in PAIR_KINDS.iter().enumerate() {
+                        let (open_character, close_character) = delimiters_for(*kind);
+                        if character == open_character {
+                            opens[index].push(position);
+                            close_of[index].push(UNMATCHED);
+                            stacks[index].push(opens[index].len() - 1);
+                        } else if character == close_character {
+                            if let Some(open_index) = stacks[index].pop() {
+                                close_of[index][open_index] = position;
+                            }
+                        }
                     }
                 }
             }
+            chunk_byte_start += chunk.len();
+            chunk_char_start = document
+                .rope()
+                .byte_to_char(chunk_byte_start);
         }
 
         // Growing by doubling leaves up to half the capacity unused, and at four

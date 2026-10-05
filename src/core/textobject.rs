@@ -651,6 +651,8 @@ pub(crate) fn delimiters_for(kind: PairKind) -> (char, char) {
 }
 
 pub(crate) fn is_escaped(document: &Document, index: usize) -> bool {
+    // Runs of backslashes are short in real code, so a backward walk one
+    // character at a time costs what it costs to read the run, no more.
     let mut backslashes = 0usize;
     let mut current = index;
     while current > 0 {

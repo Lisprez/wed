@@ -1,4 +1,5 @@
 use super::document::Document;
+use std::cell::Cell;
 use super::history::{Edit, History};
 use super::motion::{self, Motion, MotionResult};
 use super::position::{CharPos, CharRange, RangeKind};
@@ -181,6 +182,25 @@ impl Selection {
 /// Fallback page size before the terminal reports its real height.
 const DEFAULT_VIEWPORT_HEIGHT: usize = 10;
 
+/// Rows a renderer has to repaint, tracked per edit so it can skip the rows
+/// that did not change. `full` is set whenever an edit crossed a line
+/// boundary, because then every row below can have shifted.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DirtyLines {
+    pub lines: Option<(usize, usize)>,
+    pub full: bool,
+}
+
+impl DirtyLines {
+    fn touch(&mut self, first: usize, last: usize, crossed_line: bool) {
+        self.lines = Some(match self.lines {
+            Some((a, b)) => (a.min(first), b.max(last)),
+            None => (first, last),
+        });
+        self.full |= crossed_line;
+    }
+}
+
 pub struct Editor {
     pub document: Document,
     pub cursor: CharPos,
@@ -189,6 +209,7 @@ pub struct Editor {
     pub message: String,
     search_input: String,
     search_backwards: bool,
+    search_prompt_text: String,
     last_search: Option<String>,
     search_buffer: String,
     pub history: History,
@@ -212,6 +233,10 @@ pub struct Editor {
     /// not get them without leaving the editor. See [`Editor::supply_clipboard`].
     clipboard_request: Option<PasteRequest>,
     viewport_height: usize,
+    /// Read and cleared by the renderer once per frame (see
+    /// [`Editor::take_dirty_lines`]). A `Cell` so the renderer, which only
+    /// holds `&App`, can take it without `&mut`.
+    pub dirty: Cell<DirtyLines>,
 }
 
 impl Editor {
@@ -228,6 +253,7 @@ impl Editor {
             message: String::new(),
             search_input: String::new(),
             search_backwards: false,
+            search_prompt_text: String::new(),
             last_search: None,
             search_buffer: String::new(),
             history: History::new(),
@@ -246,6 +272,7 @@ impl Editor {
             pending_clipboard_text: None,
             clipboard_request: None,
             viewport_height: DEFAULT_VIEWPORT_HEIGHT,
+            dirty: Cell::new(DirtyLines::default()),
         }
     }
 
@@ -279,9 +306,14 @@ impl Editor {
         self.pending_register = None;
         self.clipboard_request = None;
         self.search_input.clear();
+        self.search_prompt_text.clear();
         self.last_search = None;
         self.message.clear();
         self.pending_clipboard_text = None;
+        self.dirty.set(DirtyLines {
+            lines: None,
+            full: true,
+        });
     }
 
     pub fn is_dirty(&self) -> bool {
@@ -294,6 +326,25 @@ impl Editor {
 
     pub fn set_viewport_height(&mut self, height: usize) {
         self.viewport_height = height.max(1);
+    }
+
+    /// Rows touched by edits since the last call, plus whether any of those
+    /// edits crossed a line boundary.
+    pub fn take_dirty_lines(&self) -> DirtyLines {
+        self.dirty.replace(DirtyLines::default())
+    }
+
+    fn mark_dirty(&self, range: CharRange, removed: &str, inserted: &str) {
+        let inserted_len = inserted.chars().count();
+        let first = self.document.pos_to_line_col(range.start).line;
+        let last = self
+            .document
+            .pos_to_line_col(range.start.advance(inserted_len))
+            .line;
+        let crossed = removed.contains('\n') || inserted.contains('\n');
+        let mut dirty = self.dirty.get();
+        dirty.touch(first, last, crossed);
+        self.dirty.set(dirty);
     }
 
     pub fn mark_saved(&mut self) {
@@ -378,14 +429,8 @@ impl Editor {
             || self.register_pending
     }
 
-    pub fn search_prompt(&self) -> Option<String> {
-        (self.mode == Mode::Search).then(|| {
-            format!(
-                "{}{}",
-                if self.search_backwards { '?' } else { '/' },
-                self.search_input
-            )
-        })
+    pub fn search_prompt(&self) -> Option<&str> {
+        (self.mode == Mode::Search).then(|| &self.search_prompt_text[..])
     }
 
     pub fn replace_text(&mut self, text: &str) {
@@ -622,6 +667,7 @@ impl Editor {
         self.mode = Mode::Search;
         self.search_backwards = backwards;
         self.search_input.clear();
+        self.search_prompt_text = (if backwards { '?' } else { '/' }).to_string();
         self.message.clear();
     }
 
@@ -631,9 +677,13 @@ impl Editor {
                 self.mode = Mode::Normal;
                 self.search_input.clear();
             }
-            Key::Char(character) => self.search_input.push(character),
+            Key::Char(character) => {
+                self.search_input.push(character);
+                self.search_prompt_text.push(character);
+            }
             Key::Backspace => {
                 self.search_input.pop();
+                self.search_prompt_text.pop();
             }
             Key::Enter => {
                 let query = self.search_input.clone();
@@ -1658,11 +1708,8 @@ impl Editor {
             return;
         }
         self.document.overwrite_range(range, &inserted);
-        self.history.record(Edit {
-            start: range.start,
-            removed,
-            inserted,
-        });
+        self.mark_dirty(range, &removed, &inserted);
+        self.history.record(Edit::new(range.start, removed, inserted));
         self.revision = self.revision.saturating_add(1);
     }
 
@@ -1673,11 +1720,9 @@ impl Editor {
         if removed == inserted {
             return;
         }
-        self.history.record(Edit {
-            start: range.start,
-            removed,
-            inserted: inserted.to_string(),
-        });
+        self.mark_dirty(range, &removed, inserted);
+        self.history
+            .record(Edit::new(range.start, removed, inserted.to_string()));
         self.revision = self.revision.saturating_add(1);
     }
 
@@ -1687,6 +1732,10 @@ impl Editor {
             self.revision = self.revision.saturating_add(1);
             self.mode = Mode::Normal;
             self.selection = None;
+            self.dirty.set(DirtyLines {
+                lines: None,
+                full: true,
+            });
         }
     }
 
@@ -1696,6 +1745,10 @@ impl Editor {
             self.revision = self.revision.saturating_add(1);
             self.mode = Mode::Normal;
             self.selection = None;
+            self.dirty.set(DirtyLines {
+                lines: None,
+                full: true,
+            });
         }
     }
 

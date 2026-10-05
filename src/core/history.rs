@@ -23,6 +23,24 @@ pub struct Edit {
     pub start: CharPos,
     pub removed: String,
     pub inserted: String,
+    /// Character counts of the two halves, captured once at record time so the
+    /// undo/redo walk does not recount them on every replay.
+    pub removed_len: usize,
+    pub inserted_len: usize,
+}
+
+impl Edit {
+    pub fn new(start: CharPos, removed: String, inserted: String) -> Self {
+        let removed_len = removed.chars().count();
+        let inserted_len = inserted.chars().count();
+        Self {
+            start,
+            removed,
+            inserted,
+            removed_len,
+            inserted_len,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -120,7 +138,7 @@ impl History {
         for edit in transaction.edits.iter().rev() {
             let current = CharRange::new(
                 edit.start,
-                edit.start.advance(edit.inserted.chars().count()),
+                edit.start.advance(edit.inserted_len),
             );
             document.overwrite_range(current, &edit.removed);
         }
@@ -136,13 +154,13 @@ impl History {
         let transaction = self.redo_stack.pop()?;
         for edit in &transaction.edits {
             let current =
-                CharRange::new(edit.start, edit.start.advance(edit.removed.chars().count()));
+                CharRange::new(edit.start, edit.start.advance(edit.removed_len));
             document.overwrite_range(current, &edit.inserted);
         }
         let cursor = transaction
             .edits
             .last()
-            .map(|edit| edit.start.advance(edit.inserted.chars().count()));
+            .map(|edit| edit.start.advance(edit.inserted_len));
         self.undo_stack.push_back(transaction);
         self.enforce_budget();
         cursor
@@ -215,11 +233,7 @@ mod tests {
         let mut document = Document::from_text("hello world");
         let mut history = History::new();
         let removed = document.replace_range(CharRange::new(CharPos(6), CharPos(11)), "rust");
-        history.record(Edit {
-            start: CharPos(6),
-            removed,
-            inserted: "rust".to_string(),
-        });
+        history.record(Edit::new(CharPos(6), removed, "rust".to_string()));
         assert_eq!(document.to_string(), "hello rust");
         history.undo(&mut document);
         assert_eq!(document.to_string(), "hello world");
@@ -233,17 +247,9 @@ mod tests {
         let mut history = History::new();
         history.begin();
         let removed = document.replace_range(CharRange::new(CharPos(0), CharPos(0)), "b");
-        history.record(Edit {
-            start: CharPos(0),
-            removed,
-            inserted: "b".to_string(),
-        });
+        history.record(Edit::new(CharPos(0), removed, "b".to_string()));
         let removed = document.replace_range(CharRange::new(CharPos(1), CharPos(1)), "c");
-        history.record(Edit {
-            start: CharPos(1),
-            removed,
-            inserted: "c".to_string(),
-        });
+        history.record(Edit::new(CharPos(1), removed, "c".to_string()));
         history.commit();
         assert_eq!(document.to_string(), "bca");
         history.undo(&mut document);
@@ -255,30 +261,18 @@ mod tests {
         let mut document = Document::from_text("a");
         let mut history = History::new();
         let removed = document.replace_range(CharRange::new(CharPos(0), CharPos(1)), "b");
-        history.record(Edit {
-            start: CharPos(0),
-            removed,
-            inserted: "b".to_string(),
-        });
+        history.record(Edit::new(CharPos(0), removed, "b".to_string()));
         history.undo(&mut document);
         assert!(history.can_redo());
         let removed = document.replace_range(CharRange::new(CharPos(0), CharPos(1)), "c");
-        history.record(Edit {
-            start: CharPos(0),
-            removed,
-            inserted: "c".to_string(),
-        });
+        history.record(Edit::new(CharPos(0), removed, "c".to_string()));
         assert!(!history.can_redo());
     }
 
     /// Pushes one transaction of `bytes` characters onto the undo stack.
     fn push(history: &mut History, bytes: usize) {
         let text = "x".repeat(bytes);
-        history.record(Edit {
-            start: CharPos(0),
-            removed: String::new(),
-            inserted: text,
-        });
+        history.record(Edit::new(CharPos(0), String::new(), text));
     }
 
     #[test]
@@ -311,11 +305,7 @@ mod tests {
         let mut document = Document::from_text("abc");
         let mut history = History::new();
         let removed = document.replace_range(CharRange::new(CharPos(0), CharPos(1)), "z");
-        history.record(Edit {
-            start: CharPos(0),
-            removed,
-            inserted: "z".to_string(),
-        });
+        history.record(Edit::new(CharPos(0), removed, "z".to_string()));
         assert_eq!(history.held(), 2, "one character removed, one inserted");
         // Undoing moves the text to the redo stack rather than duplicating it.
         history.undo(&mut document);

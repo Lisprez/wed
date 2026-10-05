@@ -84,14 +84,93 @@ fn run_corpus(corpus: Corpus, target_bytes: usize, text: &str) {
     bench_cursor_display_column(corpus, &document);
     bench_matching_partner(text);
     bench_repaint_volume(corpus, text, row_offset);
+    bench_incremental_frame(corpus, text, row_offset);
+}
+
+/// Drives a real `App` through key events and a `Renderer` writing to a
+/// `Vec<u8>` sink, to measure what varying a single frame costs on the wire.
+///
+/// `paint_line`-level benches cannot see the two changes that matter most
+/// here: `FrameKey` skipping a frame that nothing would make different, and
+/// dirty-row tracking repainting only what changed. This bench is the only
+/// guard that would catch a regression in either.
+fn bench_incremental_frame(corpus: Corpus, text: &str, row_offset: usize) {
+    let mut app = app::App::new(None).unwrap();
+    app.editor.replace_text(text);
+    // Pin the cursor to the first line so the first frame does not scroll to
+    // find it: scrolling would change the viewport offsets on the very next
+    // key, and offset changes must force a full repaint rather than show off
+    // the incremental path.
+    app.editor.cursor = CharPos::ZERO;
+    let mut renderer = render::Renderer::with_writer(
+        Vec::new(),
+        TEXT_WIDTH as u16,
+        (TEXT_HEIGHT + 2) as u16,
+    );
+    app.set_viewport_height(renderer.text_height());
+    renderer.render(&app).unwrap();
+    let full_frame = renderer.sink_len();
+
+    let key = |code: crossterm::event::KeyCode| {
+        crossterm::event::KeyEvent::new(code, crossterm::event::KeyModifiers::NONE)
+    };
+
+    // Nothing changed: the frame must emit zero bytes beyond the sink.
+    let unchanged = {
+        let before = renderer.sink_len();
+        renderer.render(&app).unwrap();
+        renderer.sink_len() - before
+    };
+    assert_eq!(unchanged, 0, "an unmoved frame must emit nothing");
+
+    // One cursor move down.
+    app.handle_key(key(crossterm::event::KeyCode::Char('j')))
+        .unwrap();
+    let moved = {
+        let before = renderer.sink_len();
+        renderer.render(&app).unwrap();
+        renderer.sink_len() - before
+    };
+
+    // One inserted character.
+    app.handle_key(key(crossterm::event::KeyCode::Char('i')))
+        .unwrap();
+    app.handle_key(key(crossterm::event::KeyCode::Char('x')))
+        .unwrap();
+    app.handle_key(key(crossterm::event::KeyCode::Esc)).unwrap();
+    let edited = {
+        let before = renderer.sink_len();
+        renderer.render(&app).unwrap();
+        renderer.sink_len() - before
+    };
+
+    report(&measure(
+        format!(
+            "frame: incremental after one keystroke, {} corpus",
+            corpus.label()
+        ),
+        || {
+            app.handle_key(key(crossterm::event::KeyCode::Char('j')))
+                .unwrap();
+            renderer.render(&app).unwrap();
+        },
+    ));
+    println!(
+        "  {} corpus: full frame {} B, unchanged {} B, cursor move {} B, one edit {} B",
+        corpus.label(),
+        full_frame,
+        unchanged,
+        moved,
+        edited
+    );
 }
 
 /// Bytes a frame emits, against the bytes a frame would emit if only the rows
 /// that actually changed were repainted.
 ///
-/// A cursor move within a line changes no row content at all, so a repaint-aware
-/// renderer would emit nothing but the cursor positioning. This measures the gap
-/// between the two, which is the ceiling on what such a renderer could save.
+/// The renderer in `src/render.rs` now repaints only the dirty rows, so this
+/// remains as documentation of the gap a naive full-frame emitter has, and as a
+/// target a full-frame implementation can be compared against.
 fn bench_repaint_volume(corpus: Corpus, text: &str, row_offset: usize) {
     let document = Document::from_text(text);
     let lines = document.line_count();

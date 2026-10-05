@@ -52,25 +52,48 @@ fn main() -> io::Result<()> {
     // editor should cost nothing, and terminal resizes still arrive because
     // crossterm wakes the blocked read on SIGWINCH.
     loop {
-        match event::read()? {
-            Event::Key(key) => {
-                if key.kind == KeyEventKind::Release {
-                    continue;
-                }
-                if app.handle_key(key)? == AppOutcome::Quit {
-                    break;
-                }
-                app.set_viewport_height(renderer.text_height());
-                renderer.render(&app)?;
-            }
-            Event::Resize(width, height) => {
-                renderer.resize(width, height);
-                app.set_viewport_height(renderer.text_height());
-                renderer.render(&app)?;
-            }
-            _ => {}
+        // Block until an event arrives rather than polling on a timer: an idle
+        // editor should cost nothing, and terminal resizes still arrive because
+        // crossterm wakes the blocked read on SIGWINCH.
+        let mut quit = false;
+        handle_event(&mut app, &mut renderer, event::read()?, &mut quit)?;
+        // Drain whatever has already queued: a burst of keys renders as one
+        // frame rather than one frame per key.
+        while !quit && event::poll(std::time::Duration::ZERO)? {
+            handle_event(&mut app, &mut renderer, event::read()?, &mut quit)?;
         }
+        if quit {
+            break;
+        }
+        app.set_viewport_height(renderer.text_height());
+        renderer.render(&app)?;
     }
 
+    Ok(())
+}
+
+fn handle_event(
+    app: &mut App,
+    renderer: &mut Renderer,
+    event: Event,
+    quit: &mut bool,
+) -> io::Result<()> {
+    match event {
+        Event::Key(key) => {
+            if key.kind == KeyEventKind::Release {
+                return Ok(());
+            }
+            if app.handle_key(key)? == AppOutcome::Quit {
+                *quit = true;
+                return Ok(());
+            }
+            app.set_viewport_height(renderer.text_height());
+        }
+        Event::Resize(width, height) => {
+            renderer.resize(width, height);
+            app.set_viewport_height(renderer.text_height());
+        }
+        _ => {}
+    }
     Ok(())
 }

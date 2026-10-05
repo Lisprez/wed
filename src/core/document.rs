@@ -3,6 +3,8 @@ use super::position::{CharPos, CharRange, LineColumn};
 use ropey::Rope;
 use std::cell::RefCell;
 use std::fmt;
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::thread::JoinHandle;
 
 pub struct Document {
     rope: Rope,
@@ -19,6 +21,13 @@ pub struct Document {
     /// region, so there is no cheap incremental update, and a stale pairing is
     /// worse than a slow one.
     pairs: RefCell<Option<(u64, PairIndex)>>,
+    /// Index-build service: one background thread that rebuilds the pairing for
+    /// the latest mutation and delivers it on `index_result`. The foreground
+    /// builds synchronously whenever it needs an answer sooner than the worker
+    /// returns one, so a query is never wrong and never blocks on the worker.
+    index_cmd: RefCell<Option<Sender<(u64, Rope)>>>,
+    index_result: RefCell<Option<Receiver<(u64, PairIndex)>>>,
+    index_worker: RefCell<Option<JoinHandle<()>>>,
 }
 
 impl Document {
@@ -31,6 +40,9 @@ impl Document {
             rope: Rope::from_str(text),
             mutation: 1,
             pairs: RefCell::new(None),
+            index_cmd: RefCell::new(None),
+            index_result: RefCell::new(None),
+            index_worker: RefCell::new(None),
         }
     }
 
@@ -40,6 +52,9 @@ impl Document {
             rope: Rope::new(),
             mutation: 1,
             pairs: RefCell::new(None),
+            index_cmd: RefCell::new(None),
+            index_result: RefCell::new(None),
+            index_worker: RefCell::new(None),
         }
     }
 
@@ -50,9 +65,79 @@ impl Document {
 
     fn changed(&mut self) {
         self.mutation = self.mutation.wrapping_add(1);
-        // Dropping the cache is cheaper than letting `pair_index` compare
-        // generations, and it releases the memory while the text is being changed.
-        self.pairs = RefCell::new(None);
+        *self.pairs.borrow_mut() = None;
+        // Start the background rebuild now, not on the first pair query:
+        // after an edit the next query should find a warm index waiting, not
+        // spawn work it then has to pay for synchronously.
+        self.ensure_index_worker();
+        if let Some(sender) = self.index_cmd.borrow().as_ref() {
+            let _ = sender.send((self.mutation, self.rope.clone()));
+        }
+    }
+
+    /// Promotes a completed background build into the cache when it matches
+    /// the current text. Stale results are dropped: a new edit already
+    /// re-tagged the document, so an older pairing is worse than none.
+    fn try_promote_async(&self) {
+        loop {
+            let result = {
+                let borrow = self.index_result.borrow();
+                match borrow.as_ref() {
+                    Some(receiver) => receiver.try_recv(),
+                    None => return,
+                }
+            };
+            match result {
+                Ok((rev, index)) => {
+                    if rev == self.mutation {
+                        *self.pairs.borrow_mut() = Some((rev, index));
+                        return;
+                    }
+                }
+                Err(_) => return,
+            }
+        }
+    }
+
+    /// Starts the background index-build service on first use.
+    fn ensure_index_worker(&self) {
+        if self.index_cmd.borrow().is_some() {
+            return;
+        }
+        {
+            // Closing the race where two query re-entrants spawn two workers.
+            let slot = self.index_worker.borrow_mut();
+            if slot.is_some() {
+                return;
+            }
+        }
+        let (commands, jobs) = mpsc::channel();
+        let (results, done) = mpsc::channel();
+        let worker = std::thread::Builder::new()
+            .name("wed-pair-index".to_string())
+            .spawn(move || {
+                while let Ok((mut rev, mut rope)) = jobs.recv() {
+                    // Coalesce: while a build was running, the user may have
+                    // typed on. Only the latest state is worth building.
+                    while let Ok((newer_rev, newer_rope)) = jobs.try_recv() {
+                        rev = newer_rev;
+                        rope = newer_rope;
+                    }
+                    let document = Document::from_rope(rope);
+                    let index = PairIndex::build(&document);
+                    if results.send((rev, index)).is_err() {
+                        return;
+                    }
+                }
+            })
+            .expect("index worker thread");
+        *self.index_cmd.borrow_mut() = Some(commands);
+        *self.index_result.borrow_mut() = Some(done);
+        *self.index_worker.borrow_mut() = Some(worker);
+        // Cover the current state, which no `changed` delivered yet.
+        if let Some(sender) = self.index_cmd.borrow().as_ref() {
+            let _ = sender.send((self.mutation, self.rope.clone()));
+        }
     }
 
     /// Discards the cached pairing, forcing a rebuild on next use.
@@ -64,15 +149,46 @@ impl Document {
         *self.pairs.borrow_mut() = None;
     }
 
+    /// A document wrapping `rope` for index building. The mutation is
+    /// irrelevant here because nothing on the pair index itself depends on
+    /// per-document identity; the build only walks the text.
+    pub(crate) fn from_rope(rope: Rope) -> Self {
+        Self {
+            rope,
+            mutation: 0,
+            pairs: RefCell::new(None),
+            index_cmd: RefCell::new(None),
+            index_result: RefCell::new(None),
+            index_worker: RefCell::new(None),
+        }
+    }
+
     /// The delimiter pairing for the current text, building it if needed.
+    /// True when the current cached pair index, if any, matches the current
+    /// text: exactly the condition `pair_index` would not rebuild for. A caller
+    /// on a per-frame path can use this to take the exact-index answer when
+    /// it is free, and a bounded scan otherwise.
+    pub fn pair_index_warm(&self) -> bool {
+        self.try_promote_async();
+        self.pairs
+            .borrow()
+            .as_ref()
+            .is_some_and(|(tag, _)| *tag == self.mutation)
+    }
+
     pub fn pair_index(&self) -> std::cell::Ref<'_, PairIndex> {
+        self.try_promote_async();
         if !self
             .pairs
             .borrow()
             .as_ref()
             .is_some_and(|(tag, _)| *tag == self.mutation)
         {
+            // Cold or stale: build synchronously now so the caller always gets
+            // an exact answer. Start the worker so the *next* edit is covered
+            // in the background instead of stalling whoever asks next.
             *self.pairs.borrow_mut() = Some((self.mutation, PairIndex::build(self)));
+            self.ensure_index_worker();
         }
         std::cell::Ref::map(self.pairs.borrow(), |cached| {
             &cached.as_ref().expect("just populated").1
@@ -251,6 +367,14 @@ impl Document {
             next: pos.clamp(self.len_chars()).0,
             offset: 0,
         }
+    }
+
+    /// Read-only access to the underlying rope, for linear scans that need
+    /// its chunk structure. Mutations must still go through the methods on
+    /// this type, they are what keep the pair index and the mutation counter
+    /// honest.
+    pub fn rope(&self) -> &Rope {
+        &self.rope
     }
 
     pub fn pos_to_line_col(&self, pos: CharPos) -> LineColumn {

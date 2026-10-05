@@ -25,6 +25,13 @@ pub struct App {
     path: Option<PathBuf>,
     command_input: String,
     mode: AppMode,
+    /// The status-line file name, cached so a frame never re-derives it from
+    /// the path. Updated wherever `path` changes.
+    filename: String,
+    /// The `:`-prompt line, cached the same way: `command_prompt()` runs on
+    /// every frame in CommandLine mode, so re-`format!`ing each one was a
+    /// per-frame allocation.
+    command_line_prompt: String,
 }
 
 impl App {
@@ -33,11 +40,17 @@ impl App {
             Some(path) if path.exists() => Editor::from_document(read_document(path)?),
             _ => Editor::new(),
         };
+        let filename = path
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "[No Name]".to_string());
         Ok(Self {
             editor,
             path,
             command_input: String::new(),
             mode: AppMode::Editing,
+            filename,
+            command_line_prompt: ":".to_string(),
         })
     }
 
@@ -45,12 +58,16 @@ impl App {
         self.path.as_deref()
     }
 
+    pub fn filename(&self) -> &str {
+        &self.filename
+    }
+
     pub fn mode(&self) -> AppMode {
         self.mode
     }
 
-    pub fn command_prompt(&self) -> Option<String> {
-        (self.mode == AppMode::CommandLine).then(|| format!(":{}", self.command_input))
+    pub fn command_prompt(&self) -> Option<&str> {
+        (self.mode == AppMode::CommandLine).then(|| &self.command_line_prompt[..])
     }
 
     pub fn is_dirty(&self) -> bool {
@@ -91,6 +108,7 @@ impl App {
         {
             self.mode = AppMode::CommandLine;
             self.command_input.clear();
+            self.command_line_prompt = ":".to_string();
             return Ok(AppOutcome::Continue);
         }
         let key = convert_key(key);
@@ -154,6 +172,7 @@ impl App {
     pub fn save_as(&mut self, path: PathBuf) -> bool {
         self.editor.commit_pending_edit();
         if self.write_to(&path) {
+            self.filename = path.to_string_lossy().into_owned();
             self.path = Some(path);
             true
         } else {
@@ -194,6 +213,7 @@ impl App {
             }
             KeyCode::Backspace => {
                 self.command_input.pop();
+                self.command_line_prompt.pop();
             }
             KeyCode::Enter => {
                 let command = self.command_input.trim().to_string();
@@ -203,6 +223,7 @@ impl App {
             }
             KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.command_input.push(character);
+                self.command_line_prompt.push(character);
             }
             _ => {}
         }
@@ -274,6 +295,7 @@ impl App {
     fn open_path(&mut self, path: PathBuf) -> io::Result<AppOutcome> {
         self.editor.replace_document(read_document(&path)?);
         self.editor.mark_saved();
+        self.filename = path.to_string_lossy().into_owned();
         self.path = Some(path.clone());
         self.editor.message = format!("Loaded {}", path.display());
         Ok(AppOutcome::Continue)

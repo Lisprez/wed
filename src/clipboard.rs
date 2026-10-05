@@ -1,4 +1,5 @@
 use std::io;
+use std::sync::mpsc::{self, Sender};
 use std::sync::{Mutex, OnceLock};
 
 fn error_queue() -> &'static Mutex<Vec<String>> {
@@ -6,21 +7,34 @@ fn error_queue() -> &'static Mutex<Vec<String>> {
     QUEUE.get_or_init(|| Mutex::new(Vec::new()))
 }
 
-/// Queues a clipboard write on a background thread so a large yank never
-/// blocks the editing loop. Failures are collected for [`take_errors`].
+/// Queues a clipboard write on a single long-lived worker thread, so a large
+/// yank never blocks the editing loop, and back-to-back yanks arrive at the
+/// system clipboard in the order they were issued. Failures are collected for
+/// [`take_errors`].
 pub fn queue_contents(text: &str) -> io::Result<()> {
-    let owned = text.to_string();
-    std::thread::Builder::new()
-        .name("wed-clipboard".to_string())
-        .spawn(move || {
-            if let Err(error) = set_contents(&owned) {
-                if let Ok(mut queue) = error_queue().lock() {
-                    queue.push(error.to_string());
+    worker()
+        .send(text.to_string())
+        .map_err(|error| io::Error::other(format!("clipboard worker failed: {error}")))
+}
+
+fn worker() -> &'static Sender<String> {
+    static TX: OnceLock<Sender<String>> = OnceLock::new();
+    TX.get_or_init(|| {
+        let (tx, rx) = mpsc::channel::<String>();
+        std::thread::Builder::new()
+            .name("wed-clipboard".to_string())
+            .spawn(move || {
+                while let Ok(text) = rx.recv() {
+                    if let Err(error) = set_contents(&text) {
+                        if let Ok(mut queue) = error_queue().lock() {
+                            queue.push(error.to_string());
+                        }
+                    }
                 }
-            }
-        })
-        .map(|_| ())
-        .map_err(|error| io::Error::other(format!("clipboard thread failed: {error}")))
+            })
+            .expect("clipboard worker thread");
+        tx
+    })
 }
 
 /// Drains clipboard failures reported by background writes.
