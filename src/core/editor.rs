@@ -1143,7 +1143,11 @@ impl Editor {
         };
         self.history.begin();
         self.apply_edit(CharRange::empty(position), "\n");
-        self.cursor = position.advance(1);
+        // The blank line is the one `line` was pushed onto, whether the break
+        // went above it or below it, so its start is where the cursor belongs
+        // rather than the point the break was inserted at.
+        let blank = if before { line } else { line + 1 };
+        self.cursor = self.document.line_start(blank);
         self.mode = Mode::Insert;
     }
 
@@ -2267,6 +2271,29 @@ mod tests {
         editor.cursor = CharPos(2);
         keys(&mut editor, &[Key::Char('a'), Key::Char('!'), Key::Escape]);
         assert_eq!(editor.text(), "one!\n");
+    }
+
+    #[test]
+    fn opens_a_line_with_the_cursor_on_it() {
+        let mut editor = Editor::from_text("one\ntwo\nthree");
+        editor.cursor = CharPos(1);
+        keys(&mut editor, &[Key::Char('o'), Key::Char('!'), Key::Escape]);
+        assert_eq!(editor.text(), "one\n!\ntwo\nthree");
+
+        let mut editor = Editor::from_text("one\ntwo\nthree");
+        editor.cursor = CharPos(5);
+        keys(&mut editor, &[Key::Char('O'), Key::Char('!'), Key::Escape]);
+        assert_eq!(editor.text(), "one\n!\ntwo\nthree");
+
+        let mut editor = Editor::from_text("one\ntwo");
+        editor.cursor = CharPos(5);
+        keys(&mut editor, &[Key::Char('o'), Key::Char('!'), Key::Escape]);
+        assert_eq!(editor.text(), "one\ntwo\n!");
+
+        let mut editor = Editor::from_text("one\ntwo\n");
+        editor.cursor = CharPos(5);
+        keys(&mut editor, &[Key::Char('o'), Key::Char('!'), Key::Escape]);
+        assert_eq!(editor.text(), "one\ntwo\n!\n");
     }
 
     #[test]
