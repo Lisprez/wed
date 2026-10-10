@@ -19,6 +19,12 @@
 //! region, so there is no cheap incremental update, and a stale answer is worse
 //! than a slow one.
 //!
+//! # Escapes
+//!
+//! A delimiter preceded by an odd number of backslashes is literal text. The pass
+//! tracks that with the same running parity the scan paths use, so the two agree
+//! on `\"` and `\\(`.
+//!
 //! # Storage
 //!
 //! Per kind, `pairs` holds every *matched* pair as `(open, close)` sorted by
@@ -27,6 +33,12 @@
 //! which is what lets the queries skip them in O(log n) instead of walking a
 //! run of dead openers. Only matched pairs take space: 12 bytes a pair (two
 //! u32 positions plus a u32 parent index).
+//!
+//! Measured on the bracket-dense 50 MiB corpus, which holds 6,765,008 matched
+//! pairs: 77 MiB, against 103 MiB for the two `Vec<usize>` this replaces. An
+//! earlier plan called for 51 MiB from two u32 arrays with no parent index; the
+//! extra 26 MiB buys the parent chain, which is what turns `enclosing_at` from a
+//! walk over a run of dead openers into O(log + nesting depth).
 //!
 //! # Size limit
 //!
