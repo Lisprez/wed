@@ -43,6 +43,10 @@ jobs:
   # Benchmarks are not a gate, but a trend is only visible if they run. Kept to
   # the 1 MiB corpora so the job stays in the tens of seconds; run locally with
   # WED_BENCH_SCALE=full for the 50 MiB numbers in docs/perf-baseline.md.
+  #
+  # Comparing these numbers against docs/perf-baseline.md is still manual.
+  # Automatic trend checking -- storing a baseline and comparing within a
+  # tolerance -- is follow-up work, not part of this job.
   benchmark:
     name: benchmark (1 MiB corpora)
     runs-on: macos-latest
@@ -54,3 +58,15 @@ jobs:
         run: |
           cargo bench --bench edit
           cargo bench --bench render
+          cargo bench --bench alloc
+
+  # The dependency set is small and pinned, but advisories arrive without warning:
+  # a build that compiled yesterday can be flagged today.
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
