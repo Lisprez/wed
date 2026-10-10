@@ -436,7 +436,7 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use std::fs;
     use std::path::PathBuf;
-    use wed::core::{Editor, Key};
+    use wed::core::{Editor, Key, Substitution};
 
     fn keys(editor: &mut Editor, keys: &[Key]) {
         for key in keys {
@@ -483,7 +483,10 @@ mod tests {
     #[test]
     fn substitution_is_undoable_and_leaves_the_document_clean_when_redundant() {
         let mut editor = Editor::from_text("one one");
-        assert_eq!(editor.replace_literal("one", "two", true), 2);
+        assert_eq!(
+            editor.substitute(&Substitution::from_parts("one", "two", true).unwrap()),
+            2
+        );
         assert_eq!(editor.text(), "two two");
         assert!(editor.is_dirty());
 
@@ -493,7 +496,10 @@ mod tests {
         // Replacing text with itself must not leave the buffer marked dirty.
         let mut editor = Editor::from_text("one one");
         editor.mark_saved();
-        assert_eq!(editor.replace_literal("one", "one", true), 2);
+        assert_eq!(
+            editor.substitute(&Substitution::from_parts("one", "one", true).unwrap()),
+            2
+        );
         assert_eq!(editor.text(), "one one");
         assert!(!editor.is_dirty());
     }

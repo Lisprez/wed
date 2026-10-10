@@ -129,7 +129,6 @@ fn run_corpus(corpus: Corpus, target_bytes: usize, text: &str) {
     bench_pair_index(corpus, text);
     bench_search(text);
     bench_search_from_deep(text);
-    bench_replace_literal(corpus, text);
     bench_regex_substitute(corpus, text);
 }
 
@@ -373,27 +372,6 @@ fn bench_search(text: &str) {
             "search must return to Normal mode so the next sample can start over"
         );
     }));
-}
-
-/// The `:s/old/new/g` path.
-///
-/// Worth measuring on its own because it is the one command that rewrites the
-/// whole document, and the old implementation built the entire text, then the
-/// entire replacement, and kept both in the undo record.
-fn bench_replace_literal(corpus: Corpus, text: &str) {
-    let Some(needle) = common_word(text) else {
-        println!("  (no common word to substitute; skipping)");
-        return;
-    };
-    let mut editor = Editor::from_text(text);
-    editor.mark_saved();
-    report(&measure(
-        format!(
-            "substitute: s/{needle}/zz/g over a {} corpus",
-            corpus.label()
-        ),
-        || editor.replace_literal(&needle, "zz", true),
-    ));
 }
 
 /// A word that occurs often, so the substitution does real work rather than

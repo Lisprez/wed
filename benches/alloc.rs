@@ -216,7 +216,8 @@ fn bench_substitute(_corpus: Corpus, text: &str) {
     let mut editor = wed::core::Editor::from_text(text);
     settle();
     let baseline = live();
-    let replaced = editor.replace_literal(&needle, "zz", true);
+    let substitution = wed::core::Substitution::parse(&format!("s/{needle}/zz/g")).unwrap();
+    let replaced = editor.substitute(&substitution);
     let retained = live().saturating_sub(baseline);
     report(
         &format!("substitute: retained after s/{needle}/zz/g ({replaced} hits)"),
@@ -286,7 +287,8 @@ fn bench_undo(_corpus: Corpus, text: &str) {
         return;
     };
     let mut editor = wed::core::Editor::from_text(text);
-    editor.replace_literal(&needle, "zz", true);
+    let substitution = wed::core::Substitution::parse(&format!("s/{needle}/zz/g")).unwrap();
+    editor.substitute(&substitution);
     settle();
     let baseline = live();
     editor.handle_key(wed::core::Key::Char('u'));
