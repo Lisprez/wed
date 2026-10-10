@@ -9,6 +9,8 @@
 //! decides how a paste behaves: linewise text goes on its own line, characterwise
 //! text lands inline, and getting that wrong is visible immediately.
 
+use std::rc::Rc;
+
 /// Whether the text in a register is character- or line-shaped.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RegisterKind {
@@ -20,13 +22,18 @@ pub enum RegisterKind {
 /// Text held in a register, and how it should be put back.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RegisterValue {
-    pub text: String,
+    /// Shared rather than owned: a yank mirrors the same text into the register
+    /// and the pending clipboard write, and cloning the reference costs nothing.
+    pub text: Rc<str>,
     pub kind: RegisterKind,
 }
 
 impl RegisterValue {
     pub fn new(text: String, kind: RegisterKind) -> Self {
-        Self { text, kind }
+        Self {
+            text: Rc::from(text),
+            kind,
+        }
     }
 
     pub fn characterwise(text: String) -> Self {
@@ -147,11 +154,11 @@ mod tests {
     fn the_black_hole_discards_what_is_written_to_it() {
         let mut registers = Registers::new();
         registers.write(Register::Unnamed, value("kept"));
-        assert_eq!(registers.unnamed().map(|v| v.text.as_str()), Some("kept"));
+        assert_eq!(registers.unnamed().map(|v| &*v.text), Some("kept"));
 
         registers.write(Register::BlackHole, value("discarded"));
         assert_eq!(
-            registers.unnamed().map(|v| v.text.as_str()),
+            registers.unnamed().map(|v| &*v.text),
             Some("kept"),
             "the black hole must not overwrite the unnamed register"
         );

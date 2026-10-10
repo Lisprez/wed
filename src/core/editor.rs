@@ -6,6 +6,7 @@ use super::position::{CharPos, CharRange, RangeKind};
 use super::register::{Register, RegisterKind, RegisterValue, Registers};
 use super::substitute::Substitution;
 use super::textobject::{self, TextObject};
+use std::rc::Rc;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
@@ -228,7 +229,7 @@ pub struct Editor {
     /// Set once a register has been named, consumed by the next command that
     /// reads or writes one.
     pending_register: Option<Register>,
-    pending_clipboard_text: Option<String>,
+    pending_clipboard_text: Option<Rc<str>>,
     /// Set when the last command needs the system clipboard's contents and could
     /// not get them without leaving the editor. See [`Editor::supply_clipboard`].
     clipboard_request: Option<PasteRequest>,
@@ -381,7 +382,7 @@ impl Editor {
         self.document.to_string()
     }
 
-    pub fn take_clipboard_text(&mut self) -> Option<String> {
+    pub fn take_clipboard_text(&mut self) -> Option<Rc<str>> {
         self.pending_clipboard_text.take()
     }
 
@@ -1290,7 +1291,7 @@ impl Editor {
     /// push the text past the end of the row the selection sat on.
     fn write_paste_text(&mut self, value: RegisterValue, position: CharPos) {
         let linewise = value.is_linewise();
-        let mut text = value.text;
+        let mut text = value.text.to_string();
         if linewise && !text.ends_with('\n') {
             text.push('\n');
         }
@@ -1302,7 +1303,7 @@ impl Editor {
     /// last character. The caller owns the surrounding transaction.
     fn insert_at_cursor(&mut self, value: RegisterValue, before: bool, anchor: CharPos) {
         let linewise = value.is_linewise();
-        let mut text = value.text;
+        let mut text = value.text.to_string();
         let position = if linewise {
             let line = self.document.pos_to_line_col(anchor).line;
             if before {
@@ -1471,7 +1472,7 @@ impl Editor {
                     self.write_register(
                         register,
                         RegisterValue {
-                            text: text.clone(),
+                            text: Rc::from(text.as_str()),
                             kind: register_kind(kind),
                         },
                         true,
@@ -1486,7 +1487,7 @@ impl Editor {
                     self.write_register(
                         register,
                         RegisterValue {
-                            text: text.clone(),
+                            text: Rc::from(text.as_str()),
                             kind: register_kind(kind),
                         },
                         false,
@@ -1502,7 +1503,7 @@ impl Editor {
                     self.write_register(
                         register,
                         RegisterValue {
-                            text: text.clone(),
+                            text: Rc::from(text.as_str()),
                             kind: register_kind(kind),
                         },
                         false,
@@ -1572,7 +1573,7 @@ impl Editor {
                 self.write_register(
                     register,
                     RegisterValue {
-                        text,
+                        text: Rc::from(text),
                         kind: register_kind,
                     },
                     true,
@@ -1596,7 +1597,7 @@ impl Editor {
                     self.write_register(
                         register,
                         RegisterValue {
-                            text,
+                            text: Rc::from(text),
                             kind: register_kind,
                         },
                         false,
