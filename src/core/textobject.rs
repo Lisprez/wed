@@ -678,16 +678,20 @@ pub(crate) fn enclosing_pair_scan(
 /// The earliest opening delimiter at or after `cursor` that starts a balanced
 /// run.
 ///
-/// Two phases on purpose: each candidate is measured from its own position with
-/// depth starting at zero, so an unbalanced delimiter earlier in the line does
-/// not hide a balanced pair after it. `"(("` reports the inner pair rather than
-/// failing. A single depth-tracking pass cannot express that, because it counts
-/// from `cursor` and so sees only the outermost run.
+/// One forward pass with a stack. Each opener is pushed; the opener a closer
+/// pops is the one it balances, which is the same answer the old two-phase scan
+/// gave -- per candidate, depth counted from the candidate's own position. The
+/// reported pair is the completed pair with the smallest opener, so an
+/// unbalanced delimiter earlier in the window does not hide a balanced pair
+/// after it: `"(("` still reports the inner pair. A single depth-tracking pass
+/// that answered on the first pop would report the inner pair of `"(())"` too,
+/// so the answer is held until the scan ends and the smallest opener wins.
 ///
-/// On the case that actually costs time -- a document with no delimiter of this
-/// kind -- phase one is already one pass to end of file and phase two never runs,
-/// so there is nothing to win here beyond the `limit`.
-pub(crate) fn next_opening_pair_scan(
+/// The scan reaches `2 x limit` because the old form let a pair's closer sit up
+/// to `limit` characters past its own opener, and named openers up to `limit`
+/// characters past `cursor`.
+#[cfg(test)]
+fn next_opening_pair_scan_reference(
     document: &Document,
     cursor: CharPos,
     kind: PairKind,
@@ -708,6 +712,7 @@ pub(crate) fn next_opening_pair_scan(
     None
 }
 
+#[cfg(test)]
 fn matching_close(
     document: &Document,
     open: usize,
@@ -735,6 +740,63 @@ fn matching_close(
         }
     }
     None
+}
+
+pub(crate) fn next_opening_pair_scan(
+    document: &Document,
+    cursor: CharPos,
+    kind: PairKind,
+    limit: usize,
+) -> Option<(usize, usize)> {
+    let (open_character, close_character) = delimiters_for(kind);
+    let start = cursor.0.min(document.len_chars());
+    // An opener's pair is reported only if the pair completes inside the window,
+    // and the answer is the completed pair with the smallest opener position --
+    // exactly what the old two-phase scan returned. The scan reaches 2 x limit
+    // because the old form let a pair's closer sit up to `limit` past its own
+    // opener.
+    let opener_window_end = start.saturating_add(limit);
+    let scan_end = start.saturating_add(limit.saturating_mul(2));
+    let mut stack: Vec<usize> = Vec::new();
+    let mut best: Option<(usize, usize)> = None;
+    // Seed the escape parity from the backslash run just before the window: the
+    // old scan judged every opener with `is_escaped`, which looks before `start`,
+    // and a window that begins mid-run must give its first characters the same
+    // status.
+    let mut backslashes = 0usize;
+    let mut probe = start;
+    while probe > 0 {
+        probe -= 1;
+        if document.char_at(CharPos(probe)) == Some('\\') {
+            backslashes += 1;
+        } else {
+            break;
+        }
+    }
+    for (at, character) in document.chars_from(CharPos(start)).take(scan_end - start) {
+        if character == '\\' {
+            backslashes += 1;
+            continue;
+        }
+        let escaped = backslashes % 2 == 1;
+        backslashes = 0;
+        if escaped {
+            continue;
+        }
+        if character == open_character {
+            stack.push(at.0);
+        } else if character == close_character {
+            if let Some(open) = stack.pop() {
+                if open < opener_window_end
+                    && at.0 < open.saturating_add(limit)
+                    && best.is_none_or(|(best_open, _)| open < best_open)
+                {
+                    best = Some((open, at.0));
+                }
+            }
+        }
+    }
+    best
 }
 
 fn pair_kind_at(character: Option<char>) -> Option<PairKind> {
@@ -804,8 +866,9 @@ fn word_kind(character: Option<char>, big: bool) -> WordKind {
 #[cfg(test)]
 mod tests {
     use super::{
-        matching_pair, matching_partner, matching_partner_outward, matching_partner_within, parse,
-        resolve, PairKind, TextObject, PARTNER_SCAN_LIMIT,
+        matching_pair, matching_partner, matching_partner_outward, matching_partner_within,
+        next_opening_pair_scan, next_opening_pair_scan_reference, parse, resolve, PairKind,
+        TextObject, PARTNER_SCAN_LIMIT,
     };
     use crate::core::document::Document;
     use crate::core::position::CharPos;
@@ -1055,6 +1118,41 @@ mod tests {
         }
         let mut doc = String::new();
         recurse(alphabet, max_len, &mut doc, check);
+    }
+
+    #[test]
+    fn the_stack_scan_agrees_with_the_reference_at_every_limit() {
+        for (alphabet, max_len) in [
+            (&['(', ')', '\\', 'a'][..], 6),
+            (&['[', ']', '\\', 'a'][..], 6),
+            (&['(', ')', '[', ']', '\\'][..], 5),
+        ] {
+            for_each_short_document(alphabet, max_len, &mut |document| {
+                let len = document.len_chars();
+                for from in 0..=len {
+                    for limit in [1usize, 2, 3, 7, 1000, usize::MAX] {
+                        for kind in [
+                            PairKind::Parenthesis,
+                            PairKind::Bracket,
+                            PairKind::Brace,
+                            PairKind::Angle,
+                        ] {
+                            assert_eq!(
+                                next_opening_pair_scan(document, CharPos(from), kind, limit),
+                                next_opening_pair_scan_reference(
+                                    document,
+                                    CharPos(from),
+                                    kind,
+                                    limit
+                                ),
+                                "from {from}, limit {limit}, kind {kind:?}, text {:?}",
+                                document.to_string(),
+                            );
+                        }
+                    }
+                }
+            });
+        }
     }
 
     #[test]
