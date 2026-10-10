@@ -185,10 +185,12 @@ impl Document {
     /// it is free, and a bounded scan otherwise.
     pub fn pair_index_warm(&self) -> bool {
         self.try_promote_async();
-        self.pairs
-            .borrow()
-            .as_ref()
-            .is_some_and(|(tag, _)| *tag == self.mutation)
+        self.len_chars() < u32::MAX as usize
+            && self
+                .pairs
+                .borrow()
+                .as_ref()
+                .is_some_and(|(tag, _)| *tag == self.mutation)
     }
 
     pub fn pair_index(&self) -> std::cell::Ref<'_, PairIndex> {

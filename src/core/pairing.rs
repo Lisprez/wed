@@ -19,11 +19,20 @@
 //! region, so there is no cheap incremental update, and a stale answer is worse
 //! than a slow one.
 //!
-//! # Escapes
+//! # Storage
 //!
-//! A delimiter preceded by an odd number of backslashes is literal text. The pass
-//! tracks that with the same running parity the scan paths use, so the two agree
-//! on `\"` and `\\(`.
+//! Per kind, `pairs` holds every *matched* pair as `(open, close)` sorted by
+//! `open`, and `parents` holds for each entry the index of the innermost pair
+//! containing it. Openers that never found a partner are not stored at all,
+//! which is what lets the queries skip them in O(log n) instead of walking a
+//! run of dead openers. Only matched pairs take space: 12 bytes a pair (two
+//! u32 positions plus a u32 parent index).
+//!
+//! # Size limit
+//!
+//! Positions are u32, so the index covers documents under 4 Gi characters.
+//! Beyond that the build panics; callers guard on document length first and
+//! fall back to the scans, which answer the same questions without the index.
 
 use super::document::Document;
 use super::position::{CharPos, CharRange};
@@ -41,18 +50,23 @@ pub const PAIR_KINDS: [PairKind; 4] = [
     PairKind::Angle,
 ];
 
-/// Stands in for "this opening delimiter has no partner".
-const UNMATCHED: usize = usize::MAX;
+/// Stands in for "this pair has no containing pair".
+const NO_PARENT: u32 = u32::MAX;
 
 /// Delimiter pairing for one revision of a document.
 ///
-/// Two parallel arrays per kind: the opening delimiters in ascending order, and
-/// for each of them the position of its partner or [`UNMATCHED`]. Parallel
-/// arrays rather than a map because the positions are already sorted, so a lookup
-/// is a binary search rather than a hash.
+/// Per kind, `pairs` holds every *matched* pair as `(open, close)` sorted by
+/// `open`, and `parents` holds for each entry the index of the innermost pair
+/// containing it. Openers that never found a partner are not stored at
+/// all, which is what makes the queries below skip them in O(log n).
+/// Positions are u32: the index supports documents under 4 Gi characters
+/// (callers fall back to the scans beyond that) and halves the memory
+/// against usize. The parent link costs 4 bytes per pair and buys an
+/// O(log + nesting depth) `enclosing_at`.
 pub struct PairIndex {
-    opens: [Vec<usize>; PAIR_KINDS.len()],
-    close_of: [Vec<usize>; PAIR_KINDS.len()],
+    pairs: [Vec<(u32, u32)>; PAIR_KINDS.len()],
+    parents: [Vec<u32>; PAIR_KINDS.len()],
+    open_counts: [usize; PAIR_KINDS.len()],
 }
 
 fn slot(kind: PairKind) -> usize {
@@ -69,10 +83,15 @@ impl PairIndex {
     /// document that mixes them -- or is not balanced at all -- still pairs up
     /// correctly for the parts that are.
     pub fn build(document: &Document) -> Self {
-        let mut opens: [Vec<usize>; PAIR_KINDS.len()] = Default::default();
-        let mut close_of: [Vec<usize>; PAIR_KINDS.len()] = Default::default();
-        // Openers seen but not yet closed, as indices into `opens`.
-        let mut stacks: [Vec<usize>; PAIR_KINDS.len()] = Default::default();
+        assert!(
+            document.len_chars() < u32::MAX as usize,
+            "the pair index supports documents under 4 Gi characters; \
+             callers fall back to the scans beyond that"
+        );
+        let mut pairs: [Vec<(u32, u32)>; PAIR_KINDS.len()] = Default::default();
+        // Openers seen but not yet closed, as indices into `pairs`.
+        let mut stacks: [Vec<u32>; PAIR_KINDS.len()] = Default::default();
+        let mut open_counts = [0usize; PAIR_KINDS.len()];
 
         let mut backslashes = 0usize;
         let mut chunk_byte_start = 0usize;
@@ -95,12 +114,14 @@ impl PairIndex {
                             for (index, kind) in PAIR_KINDS.iter().enumerate() {
                                 let (open_character, close_character) = delimiters_for(*kind);
                                 if byte == open_character as u8 {
-                                    opens[index].push(position);
-                                    close_of[index].push(UNMATCHED);
-                                    stacks[index].push(opens[index].len() - 1);
+                                    // A close of u32::MAX marks "no partner
+                                    // yet"; the entry is dropped below.
+                                    pairs[index].push((position as u32, u32::MAX));
+                                    stacks[index].push((pairs[index].len() - 1) as u32);
+                                    open_counts[index] += 1;
                                 } else if byte == close_character as u8 {
-                                    if let Some(open_index) = stacks[index].pop() {
-                                        close_of[index][open_index] = position;
+                                    if let Some(pair) = stacks[index].pop() {
+                                        pairs[index][pair as usize].1 = position as u32;
                                     }
                                 }
                             }
@@ -122,12 +143,12 @@ impl PairIndex {
                     for (index, kind) in PAIR_KINDS.iter().enumerate() {
                         let (open_character, close_character) = delimiters_for(*kind);
                         if character == open_character {
-                            opens[index].push(position);
-                            close_of[index].push(UNMATCHED);
-                            stacks[index].push(opens[index].len() - 1);
+                            pairs[index].push((position as u32, u32::MAX));
+                            stacks[index].push((pairs[index].len() - 1) as u32);
+                            open_counts[index] += 1;
                         } else if character == close_character {
-                            if let Some(open_index) = stacks[index].pop() {
-                                close_of[index][open_index] = position;
+                            if let Some(pair) = stacks[index].pop() {
+                                pairs[index][pair as usize].1 = position as u32;
                             }
                         }
                     }
@@ -139,16 +160,38 @@ impl PairIndex {
                 .byte_to_char(chunk_byte_start);
         }
 
-        // Growing by doubling leaves up to half the capacity unused, and at four
-        // kinds on a delimiter-dense document that slack is measured in megabytes.
-        // The vectors are never appended to again, so handing the slack back is
-        // strictly worth it.
+        let mut parents: [Vec<u32>; PAIR_KINDS.len()] = Default::default();
         for kind in 0..PAIR_KINDS.len() {
-            opens[kind].shrink_to_fit();
-            close_of[kind].shrink_to_fit();
+            // Drop openers that never found a partner; their absence is what
+            // makes the queries below skip them.
+            pairs[kind].retain(|(_, close)| *close != u32::MAX);
+            let mut stack: Vec<u32> = Vec::new();
+            parents[kind] = Vec::with_capacity(pairs[kind].len());
+            for i in 0..pairs[kind].len() {
+                let open = pairs[kind][i].0;
+                while let Some(&top) = stack.last() {
+                    if pairs[kind][top as usize].1 < open {
+                        stack.pop();
+                    } else {
+                        break;
+                    }
+                }
+                parents[kind].push(stack.last().copied().unwrap_or(NO_PARENT));
+                stack.push(i as u32);
+            }
+            // Growing by doubling leaves up to half the capacity unused, and at
+            // four kinds on a delimiter-dense document that slack is measured
+            // in megabytes. The vectors are never appended to again, so handing
+            // the slack back is strictly worth it.
+            pairs[kind].shrink_to_fit();
+            parents[kind].shrink_to_fit();
         }
 
-        Self { opens, close_of }
+        Self {
+            pairs,
+            parents,
+            open_counts,
+        }
     }
 
     /// The innermost pair of `kind` that `position` sits in.
@@ -159,17 +202,20 @@ impl PairIndex {
     /// under it, which for a closer lands on that closer's own opener.
     pub fn enclosing_at(&self, kind: PairKind, position: usize) -> Option<(usize, usize)> {
         let index = slot(kind);
-        let below = self.opens[index].partition_point(|open| *open < position);
-        // The pairs containing `position` nest, so the first opener below it whose
-        // partner reaches at least this far is the innermost one.
-        let mut opener = below;
-        while opener > 0 {
-            opener -= 1;
-            let open = self.opens[index][opener];
-            let close = self.close_of[index][opener];
-            if close != UNMATCHED && close >= position {
-                return Some((open, close));
+        let pairs = &self.pairs[index];
+        let mut candidate = pairs.partition_point(|(open, _)| (*open as usize) < position);
+        while candidate > 0 {
+            candidate -= 1;
+            let (open, close) = pairs[candidate];
+            if close as usize >= position {
+                return Some((open as usize, close as usize));
             }
+            let parent = self.parents[index][candidate];
+            if parent == NO_PARENT {
+                return None;
+            }
+            // `parent + 1`, because the loop decrements before it reads.
+            candidate = parent as usize + 1;
         }
         None
     }
@@ -180,44 +226,39 @@ impl PairIndex {
     /// for an unclosed delimiter and the case that made a scan run to end of file.
     pub fn opener_pair_at(&self, kind: PairKind, position: usize) -> Option<(usize, usize)> {
         let index = slot(kind);
-        let found = self.opens[index].binary_search(&position).ok()?;
-        let close = self.close_of[index][found];
-        (close != UNMATCHED).then_some((position, close))
+        let key = u32::try_from(position).ok()?;
+        let found = self.pairs[index]
+            .binary_search_by_key(&key, |(open, _)| *open)
+            .ok()?;
+        let (open, close) = self.pairs[index][found];
+        Some((open as usize, close as usize))
     }
 
-    /// The first pair of `kind` starting at or after `from` whose opener has a
-    /// partner.
+    /// The first pair of `kind` starting at or after `from`.
     ///
-    /// Matches the scan it replaces, which also skipped openers that never close
-    /// rather than reporting the first opener and giving up.
+    /// Unmatched openers are not in the table at all, so this is a single
+    /// partition point rather than a walk over a run of dead openers.
     pub fn first_balanced_pair(&self, kind: PairKind, from: usize) -> Option<(usize, usize)> {
         let index = slot(kind);
-        let mut candidate = self.opens[index].partition_point(|open| *open < from);
-        while candidate < self.opens[index].len() {
-            let open = self.opens[index][candidate];
-            let close = self.close_of[index][candidate];
-            if close != UNMATCHED {
-                return Some((open, close));
-            }
-            candidate += 1;
-        }
-        None
+        let candidate = self.pairs[index].partition_point(|(open, _)| (*open as usize) < from);
+        let (open, close) = *self.pairs[index].get(candidate)?;
+        Some((open as usize, close as usize))
     }
 
     /// The pairs of every kind, as ranges, for callers that want all of them.
     pub fn pairs(&self, kind: PairKind) -> Vec<CharRange> {
         let index = slot(kind);
-        self.opens[index]
+        self.pairs[index]
             .iter()
-            .zip(&self.close_of[index])
-            .filter(|(_, close)| **close != UNMATCHED)
-            .map(|(open, close)| CharRange::new(CharPos(*open), CharPos(*close + 1)))
+            .map(|(open, close)| {
+                CharRange::new(CharPos(*open as usize), CharPos(*close as usize + 1))
+            })
             .collect()
     }
 
-    /// Number of opening delimiters recorded for `kind`.
+    /// Number of opening delimiters seen, matched or not.
     pub fn open_count(&self, kind: PairKind) -> usize {
-        self.opens[slot(kind)].len()
+        self.open_counts[slot(kind)]
     }
 }
 
@@ -245,7 +286,7 @@ pub fn enclosing_pair(
     kind: PairKind,
     limit: usize,
 ) -> Option<(usize, usize)> {
-    if limit != usize::MAX {
+    if limit != usize::MAX || document.len_chars() >= u32::MAX as usize {
         return super::textobject::enclosing_pair_scan(document, cursor, kind, limit);
     }
     let index = document.pair_index();
@@ -266,7 +307,7 @@ pub fn next_opening_pair(
     kind: PairKind,
     limit: usize,
 ) -> Option<(usize, usize)> {
-    if limit != usize::MAX {
+    if limit != usize::MAX || document.len_chars() >= u32::MAX as usize {
         return next_opening_pair_scan(document, cursor, kind, limit);
     }
     let index = document.pair_index();
@@ -275,7 +316,7 @@ pub fn next_opening_pair(
 
 #[cfg(test)]
 mod tests {
-    use super::{PairIndex, PAIR_KINDS, UNMATCHED};
+    use super::{PairIndex, PAIR_KINDS};
     use crate::core::document::Document;
     use crate::core::position::CharPos;
     use crate::core::textobject::{enclosing_pair_scan, next_opening_pair_scan, PairKind};
@@ -465,6 +506,5 @@ mod tests {
                 );
             }
         }
-        let _ = UNMATCHED;
     }
 }
