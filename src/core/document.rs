@@ -3,8 +3,14 @@ use super::position::{CharPos, CharRange, LineColumn};
 use ropey::Rope;
 use std::cell::RefCell;
 use std::fmt;
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread::JoinHandle;
+
+/// How long the index worker waits for the typing to stop before rebuilding.
+/// A trailing debounce on the worker side: every new snapshot resets it, so
+/// continuous typing never rebuilds, and a pause of this length rebuilds
+/// once without any foreground polling.
+const INDEX_REBUILD_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(250);
 
 pub struct Document {
     rope: Rope,
@@ -66,9 +72,10 @@ impl Document {
     fn changed(&mut self) {
         self.mutation = self.mutation.wrapping_add(1);
         *self.pairs.borrow_mut() = None;
-        // Start the background rebuild now, not on the first pair query:
-        // after an edit the next query should find a warm index waiting, not
-        // spawn work it then has to pay for synchronously.
+        // Hand the new state to the worker as a snapshot. It is only a marker
+        // of the latest state: the worker debounces on the trailing edge, so
+        // continuous typing never triggers a rebuild and a pause of
+        // INDEX_REBUILD_DEBOUNCE rebuilds exactly once.
         self.ensure_index_worker();
         if let Some(sender) = self.index_cmd.borrow().as_ref() {
             let _ = sender.send((self.mutation, self.rope.clone()));
@@ -117,11 +124,19 @@ impl Document {
             .name("wed-pair-index".to_string())
             .spawn(move || {
                 while let Ok((mut rev, mut rope)) = jobs.recv() {
-                    // Coalesce: while a build was running, the user may have
-                    // typed on. Only the latest state is worth building.
-                    while let Ok((newer_rev, newer_rope)) = jobs.try_recv() {
-                        rev = newer_rev;
-                        rope = newer_rope;
+                    // Trailing debounce: absorb newer snapshots until the typing
+                    // has stopped for INDEX_REBUILD_DEBOUNCE. A disconnected
+                    // channel means the document is gone, so exit without
+                    // building.
+                    loop {
+                        match jobs.recv_timeout(INDEX_REBUILD_DEBOUNCE) {
+                            Ok((newer_rev, newer_rope)) => {
+                                rev = newer_rev;
+                                rope = newer_rope;
+                            }
+                            Err(RecvTimeoutError::Timeout) => break,
+                            Err(RecvTimeoutError::Disconnected) => return,
+                        }
                     }
                     let document = Document::from_rope(rope);
                     let index = PairIndex::build(&document);
@@ -568,5 +583,19 @@ mod tests {
             .collect();
         let expected: Vec<char> = text.chars().rev().collect();
         assert_eq!(backwards, expected);
+    }
+
+    #[test]
+    fn the_index_worker_rebuilds_after_the_typing_stops() {
+        let mut document = Document::from_text("fn f() { (a) }");
+        document.insert_str(CharPos(0), "x");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !document.pair_index_warm() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the index never became warm after the debounce"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
     }
 }
