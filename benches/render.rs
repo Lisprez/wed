@@ -94,7 +94,7 @@ fn run_corpus(corpus: Corpus, target_bytes: usize, text: &str) {
 /// here: `FrameKey` skipping a frame that nothing would make different, and
 /// dirty-row tracking repainting only what changed. This bench is the only
 /// guard that would catch a regression in either.
-fn bench_incremental_frame(corpus: Corpus, text: &str, row_offset: usize) {
+fn bench_incremental_frame(corpus: Corpus, text: &str, _row_offset: usize) {
     let mut app = app::App::new(None).unwrap();
     app.editor.replace_text(text);
     // Pin the cursor to the first line so the first frame does not scroll to
@@ -102,11 +102,8 @@ fn bench_incremental_frame(corpus: Corpus, text: &str, row_offset: usize) {
     // key, and offset changes must force a full repaint rather than show off
     // the incremental path.
     app.editor.cursor = CharPos::ZERO;
-    let mut renderer = render::Renderer::with_writer(
-        Vec::new(),
-        TEXT_WIDTH as u16,
-        (TEXT_HEIGHT + 2) as u16,
-    );
+    let mut renderer =
+        render::Renderer::with_writer(Vec::new(), TEXT_WIDTH as u16, (TEXT_HEIGHT + 2) as u16);
     app.set_viewport_height(renderer.text_height());
     renderer.render(&app).unwrap();
     let full_frame = renderer.sink_len();

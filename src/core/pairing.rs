@@ -155,9 +155,7 @@ impl PairIndex {
                 }
             }
             chunk_byte_start += chunk.len();
-            chunk_char_start = document
-                .rope()
-                .byte_to_char(chunk_byte_start);
+            chunk_char_start = document.rope().byte_to_char(chunk_byte_start);
         }
 
         let mut parents: [Vec<u32>; PAIR_KINDS.len()] = Default::default();

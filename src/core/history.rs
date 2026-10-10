@@ -138,10 +138,7 @@ impl History {
     pub fn undo(&mut self, document: &mut Document) -> Option<CharPos> {
         let transaction = self.undo_stack.pop_back()?;
         for edit in transaction.edits.iter().rev() {
-            let current = CharRange::new(
-                edit.start,
-                edit.start.advance(edit.inserted_len),
-            );
+            let current = CharRange::new(edit.start, edit.start.advance(edit.inserted_len));
             document.overwrite_range(current, &edit.removed);
         }
         let cursor = transaction.edits.first().map(|edit| edit.start);
@@ -155,8 +152,7 @@ impl History {
     pub fn redo(&mut self, document: &mut Document) -> Option<CharPos> {
         let transaction = self.redo_stack.pop()?;
         for edit in &transaction.edits {
-            let current =
-                CharRange::new(edit.start, edit.start.advance(edit.removed_len));
+            let current = CharRange::new(edit.start, edit.start.advance(edit.removed_len));
             document.overwrite_range(current, &edit.inserted);
         }
         let cursor = transaction

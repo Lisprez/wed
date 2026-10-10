@@ -54,6 +54,9 @@ impl App {
         })
     }
 
+    // Dead from the plain binary, which never asks for the path; the tests in
+    // this file are its callers.
+    #[allow(dead_code)]
     pub fn path(&self) -> Option<&Path> {
         self.path.as_deref()
     }

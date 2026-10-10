@@ -83,6 +83,9 @@ impl Renderer<io::Stdout> {
 impl<W: Write> Renderer<W> {
     /// Builds a renderer writing to `writer` rather than stdout, with an
     /// explicitly-sized viewport. The benchmark uses this to capture frames.
+    // Dead from the binary, which always renders to stdout: the bench and unit
+    // test targets that share this file through `#[path]` are its callers.
+    #[allow(dead_code)]
     pub fn with_writer(writer: W, width: u16, height: u16) -> Self {
         Self {
             writer: BufWriter::with_capacity(1 << 16, writer),
@@ -157,11 +160,7 @@ impl<W: Write> Renderer<W> {
             width: self.width,
             height: self.height,
             message: editor.message.clone(),
-            search_prompt: app
-                .editor
-                .search_prompt()
-                .unwrap_or_default()
-                .to_string(),
+            search_prompt: app.editor.search_prompt().unwrap_or_default().to_string(),
             command_prompt: app.command_prompt().unwrap_or_default().to_string(),
         };
         if self.last_frame.as_ref() == Some(&frame_key) {
@@ -190,9 +189,10 @@ impl<W: Write> Renderer<W> {
             .last_frame
             .as_ref()
             .is_none_or(|prev| prev.cursor != editor.cursor);
-        let mode_changed = self.last_frame.as_ref().is_none_or(|prev| {
-            (prev.mode, prev.app_mode) != (editor.mode, app.mode())
-        });
+        let mode_changed = self
+            .last_frame
+            .as_ref()
+            .is_none_or(|prev| (prev.mode, prev.app_mode) != (editor.mode, app.mode()));
         let selection_changed = old_selection != editor.selection;
         let prev_cursor = self.last_frame.as_ref().map(|prev| prev.cursor);
         let prev_selection = old_selection;
@@ -229,9 +229,8 @@ impl<W: Write> Renderer<W> {
                 partner
             }
         };
-        let full_paint = self.last_frame.is_none()
-            || offsets_changed
-            || (revision_changed && dirty.full);
+        let full_paint =
+            self.last_frame.is_none() || offsets_changed || (revision_changed && dirty.full);
         if full_paint {
             for screen_row in 0..text_height {
                 let file_row = self.row_offset + screen_row;
@@ -281,16 +280,17 @@ impl<W: Write> Renderer<W> {
                 }
             }
             if selection_changed {
-                for selection in [prev_selection.as_ref(), editor.selection.as_ref()] {
-                    if let Some(selection) = selection {
-                        for range in selection.ranges(document) {
-                            let first = document.pos_to_line_col(range.start).line;
-                            let last = document
-                                .pos_to_line_col(CharPos(range.end.0.saturating_sub(1)))
-                                .line;
-                            for row in first..=last {
-                                add_row(&mut rows, row);
-                            }
+                for selection in [prev_selection.as_ref(), editor.selection.as_ref()]
+                    .into_iter()
+                    .flatten()
+                {
+                    for range in selection.ranges(document) {
+                        let first = document.pos_to_line_col(range.start).line;
+                        let last = document
+                            .pos_to_line_col(CharPos(range.end.0.saturating_sub(1)))
+                            .line;
+                        for row in first..=last {
+                            add_row(&mut rows, row);
                         }
                     }
                 }
@@ -438,7 +438,8 @@ impl<W: Write> Renderer<W> {
             }
             _ => {
                 let recomputed = safe_text(message, width);
-                self.cached_visible_message = Some((message.to_string(), width, recomputed.clone()));
+                self.cached_visible_message =
+                    Some((message.to_string(), width, recomputed.clone()));
                 recomputed
             }
         };
@@ -637,6 +638,9 @@ pub(crate) fn matching_partner_for_render(app: &App) -> Option<CharPos> {
 impl Renderer<Vec<u8>> {
     /// Bytes written to the sink so far. The sink only advances after
     /// `render` flushes, so it reflects whole frames.
+    // Dead from the binary, which never reads the frame back: the bench target
+    // that shares this file through `#[path]` is its caller.
+    #[allow(dead_code)]
     pub fn sink_len(&self) -> usize {
         self.writer.get_ref().len()
     }

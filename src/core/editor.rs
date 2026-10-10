@@ -1,11 +1,11 @@
 use super::document::Document;
-use std::cell::Cell;
 use super::history::{Edit, History};
 use super::motion::{self, Motion, MotionResult};
 use super::position::{CharPos, CharRange, RangeKind};
 use super::register::{Register, RegisterKind, RegisterValue, Registers};
 use super::substitute::Substitution;
 use super::textobject::{self, TextObject};
+use std::cell::Cell;
 use std::rc::Rc;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1717,7 +1717,8 @@ impl Editor {
         }
         self.document.overwrite_range(range, &inserted);
         self.mark_dirty(range, &removed, &inserted);
-        self.history.record(Edit::new(range.start, removed, inserted));
+        self.history
+            .record(Edit::new(range.start, removed, inserted));
         self.revision = self.revision.saturating_add(1);
     }
 
