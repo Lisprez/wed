@@ -425,6 +425,18 @@ impl Default for Document {
     }
 }
 
+impl Drop for Document {
+    fn drop(&mut self) {
+        // Close the command channel first: the worker's next recv() fails
+        // and the loop exits, so the join below cannot hang. If a build is
+        // in flight this waits for it, which is bounded by one index build.
+        *self.index_cmd.borrow_mut() = None;
+        if let Some(worker) = self.index_worker.borrow_mut().take() {
+            let _ = worker.join();
+        }
+    }
+}
+
 /// Characters read backwards from the document, nearest first.
 pub struct CharsBefore<'a> {
     document: &'a Document,
