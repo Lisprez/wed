@@ -19,6 +19,6 @@ pub use position::{CharPos, CharRange, LineColumn, RangeKind};
 pub use register::{Register, RegisterKind, RegisterValue, Registers};
 pub use substitute::Substitution;
 pub use textobject::{
-    matching_partner, matching_partner_within, resolve as resolve_text_object, PairKind,
-    TextObject, PARTNER_SCAN_LIMIT,
+    matching_partner, matching_partner_outward, matching_partner_within,
+    resolve as resolve_text_object, PairKind, TextObject, PARTNER_SCAN_LIMIT,
 };

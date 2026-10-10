@@ -623,7 +623,7 @@ pub(crate) fn matching_partner_for_render(app: &App) -> Option<CharPos> {
         if app.editor.document.pair_index_warm() {
             wed::core::matching_partner(&app.editor.document, app.editor.cursor)
         } else {
-            wed::core::matching_partner_within(
+            wed::core::matching_partner_outward(
                 &app.editor.document,
                 app.editor.cursor,
                 wed::core::PARTNER_SCAN_LIMIT,

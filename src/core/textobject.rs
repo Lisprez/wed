@@ -152,6 +152,102 @@ pub fn matching_partner_within(
     }
 }
 
+/// The bracket highlight partner for the cursor, found with two bounded
+/// walks instead of the enclosing scan plus four opening scans. Equivalent
+/// to [`matching_partner_within`] at the same `limit`; the exhaustive test
+/// `the_outward_walk_agrees_with_the_bounded_scan_on_every_short_input`
+/// holds the two together.
+pub fn matching_partner_outward(
+    document: &Document,
+    cursor: CharPos,
+    limit: usize,
+) -> Option<CharPos> {
+    if document.is_empty() {
+        return None;
+    }
+    let position = cursor.0.min(document.len_chars() - 1);
+    let character = document.char_at(CharPos(position))?;
+    let (open_character, close_character) = match character {
+        '(' | ')' => ('(', ')'),
+        '[' | ']' => ('[', ']'),
+        '{' | '}' => ('{', '}'),
+        '<' | '>' => ('<', '>'),
+        '"' | '\'' | '`' => return matching_quote_partner(document, position, character),
+        _ => return None,
+    };
+    let is_open = character == open_character;
+
+    // Backward: to the opener at depth zero. The delimiter under the cursor
+    // is handled explicitly: an unescaped opener ends the walk, an
+    // unescaped closer is skipped, matching `enclosing_pair_scan`. The
+    // escape check needs the backslashes *before* each delimiter, which a
+    // backward walk has not seen yet, so this leg asks `is_escaped` (a
+    // short walk over the run) rather than carrying a running parity; the
+    // forward leg below uses a running parity because it visits in order.
+    let mut depth = 0usize;
+    let mut open_at = None;
+    for (at, c) in document.chars_before(CharPos(position + 1)).take(limit) {
+        let index = at.0;
+        if c != open_character && c != close_character {
+            continue;
+        }
+        if is_escaped(document, index) {
+            continue;
+        }
+        if index == position {
+            if is_open {
+                open_at = Some(index);
+                break;
+            }
+            // The closer under the cursor is not counted, matching the scan.
+            continue;
+        }
+        if c == close_character {
+            depth += 1;
+        } else if depth == 0 {
+            open_at = Some(index);
+            break;
+        } else {
+            depth -= 1;
+        }
+    }
+    let open_at = open_at?;
+
+    // Forward: from the opener to its closer.
+    let mut depth = 0usize;
+    let mut backslashes = 0usize;
+    for (at, c) in document.chars_from(CharPos(open_at)).take(limit) {
+        if c == '\\' {
+            backslashes += 1;
+            continue;
+        }
+        let escaped = backslashes % 2 == 1;
+        backslashes = 0;
+        if escaped {
+            continue;
+        }
+        if c == open_character {
+            depth += 1;
+        } else if c == close_character {
+            depth = depth.saturating_sub(1);
+            if depth == 0 {
+                // The pair belongs to the cursor only when the cursor sits
+                // on one of its ends; a cursor on an escaped delimiter
+                // inside a real pair gets no highlight, matching the
+                // bounded scan whose fallback result the filter discards.
+                if open_at == position {
+                    return Some(at);
+                } else if at.0 == position {
+                    return Some(CharPos(open_at));
+                } else {
+                    return None;
+                }
+            }
+        }
+    }
+    None
+}
+
 fn matching_quote_partner(document: &Document, position: usize, quote: char) -> Option<CharPos> {
     let line = document.pos_to_line_col(CharPos(position)).line;
     let start = document.line_start(line).0;
@@ -698,8 +794,8 @@ fn word_kind(character: Option<char>, big: bool) -> WordKind {
 #[cfg(test)]
 mod tests {
     use super::{
-        matching_pair, matching_partner, matching_partner_within, parse, resolve, PairKind,
-        TextObject, PARTNER_SCAN_LIMIT,
+        matching_pair, matching_partner, matching_partner_outward, matching_partner_within, parse,
+        resolve, PairKind, TextObject, PARTNER_SCAN_LIMIT,
     };
     use crate::core::document::Document;
     use crate::core::position::CharPos;
@@ -922,6 +1018,93 @@ mod tests {
         assert_eq!(
             matching_partner(&document, CharPos(0)),
             Some(CharPos(gap + 1))
+        );
+    }
+
+    /// Every document over the given alphabet up to `max_len` characters.
+    fn for_each_short_document(
+        alphabet: &[char],
+        max_len: usize,
+        check: &mut impl FnMut(&Document),
+    ) {
+        fn recurse(
+            alphabet: &[char],
+            max_len: usize,
+            doc: &mut String,
+            check: &mut impl FnMut(&Document),
+        ) {
+            check(&Document::from_text(doc));
+            if doc.chars().count() >= max_len {
+                return;
+            }
+            for &c in alphabet {
+                doc.push(c);
+                recurse(alphabet, max_len, doc, check);
+                doc.pop();
+            }
+        }
+        let mut doc = String::new();
+        recurse(alphabet, max_len, &mut doc, check);
+    }
+
+    #[test]
+    fn the_outward_walk_agrees_with_the_bounded_scan_on_every_short_input() {
+        for (alphabet, max_len) in [
+            (&['(', ')', '\\', 'a'][..], 6),
+            (&['[', ']', '\\', 'a'][..], 6),
+            (&['{', '}', '(', ')'][..], 6),
+            (&['"', 'a', '\\'][..], 6),
+            (&['(', ')', '[', ']', '\\'][..], 5),
+        ] {
+            for_each_short_document(alphabet, max_len, &mut |document| {
+                let len = document.len_chars();
+                for cursor in 0..=len {
+                    for limit in [1usize, 2, 3, 5, 64] {
+                        assert_eq!(
+                            matching_partner_outward(document, CharPos(cursor), limit),
+                            matching_partner_within(document, CharPos(cursor), limit),
+                            "cursor {cursor}, limit {limit}, text {:?}",
+                            document.to_string(),
+                        );
+                    }
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn the_outward_walk_pins_the_closer_cases() {
+        // Cursor on a matched closer: the partner is its opener.
+        let document = Document::from_text("()");
+        assert_eq!(
+            matching_partner_outward(&document, CharPos(1), PARTNER_SCAN_LIMIT),
+            Some(CharPos(0))
+        );
+        // Nested: the cursor's own closer belongs to the inner pair.
+        let document = Document::from_text("(())");
+        assert_eq!(
+            matching_partner_outward(&document, CharPos(2), PARTNER_SCAN_LIMIT),
+            Some(CharPos(1))
+        );
+        // An unmatched opener with a balanced pair later: no highlight, same as
+        // the bounded scan (its fallback result was always discarded).
+        let document = Document::from_text("( a (b)");
+        assert_eq!(
+            matching_partner_outward(&document, CharPos(0), PARTNER_SCAN_LIMIT),
+            None
+        );
+        // An escaped opener is literal text.
+        let document = Document::from_text(r"\(");
+        assert_eq!(
+            matching_partner_outward(&document, CharPos(1), PARTNER_SCAN_LIMIT),
+            None
+        );
+        // A cursor on an escaped delimiter inside a real pair: the pair does
+        // not belong to the cursor, so there is no highlight.
+        let document = Document::from_text("(((\\()");
+        assert_eq!(
+            matching_partner_outward(&document, CharPos(4), PARTNER_SCAN_LIMIT),
+            None
         );
     }
 }
