@@ -451,12 +451,20 @@ fn pair_object(
     })
 }
 
+/// Longest tag body the tag search reads before treating the `<` as literal
+/// text. A real tag header is a handful of characters; past this the `<` is
+/// ordinary text (a maths comparison, say) and reading further only costs time.
+const TAG_BODY_LIMIT: usize = 1024;
+
 fn tag_object(document: &Document, cursor: CharPos, around: bool) -> Option<CharRange> {
     // Lexes and matches in one pass: the old code lexed the whole document
     // into a `Vec<Tag>` first, but matching only ever needs the first pair
     // closed in document order that contains the cursor, so tags after that
     // point are never read.
     let mut stack: Vec<(String, usize)> = Vec::new();
+    // Reused across tags: a document is full of them and each is short, so a
+    // buffer per tag would mean an allocation per tag.
+    let mut body = String::new();
     let mut chars = document.chars_from(CharPos::ZERO);
     while let Some((index, character)) = chars.next() {
         if character != '<' {
@@ -464,9 +472,9 @@ fn tag_object(document: &Document, cursor: CharPos, around: bool) -> Option<Char
         }
         // One pass to the closing '>', so a document full of '<' does not
         // rescan the remainder of the file for every one of them.
-        let mut body = String::new();
+        body.clear();
         let mut closed = None;
-        for (position, inner) in chars.by_ref() {
+        for (position, inner) in chars.by_ref().take(TAG_BODY_LIMIT) {
             if inner == '>' {
                 closed = Some(position);
                 break;
@@ -474,7 +482,12 @@ fn tag_object(document: &Document, cursor: CharPos, around: bool) -> Option<Char
             body.push(inner);
         }
         let Some(end) = closed else {
-            break;
+            // A `<` that stays open past the limit is literal text, and the
+            // outer loop resumes just after the region already consumed, so the
+            // next TAG_BODY_LIMIT characters are not treated as tag starts.
+            // Aborting here instead would let one stray `<` hide every tag that
+            // follows it.
+            continue;
         };
         let trimmed = body.trim();
         if trimmed.is_empty() {
@@ -1226,5 +1239,17 @@ mod tests {
         );
         // A zero-width window gives up.
         assert_eq!(matching_partner_within(&document, CharPos(0), 0), None);
+    }
+
+    #[test]
+    fn a_stray_angle_bracket_does_not_hide_later_tags() {
+        let gap = "a".repeat(1024 + 64);
+        let document = Document::from_text(&format!("<{gap}<b>x</b>"));
+        let cursor = CharPos(document.to_string().find('x').unwrap());
+        let range = super::resolve(&document, cursor, TextObject::Tag { around: false }, 1);
+        assert!(
+            range.is_some(),
+            "a stray `<` must not hide the pair after it"
+        );
     }
 }
