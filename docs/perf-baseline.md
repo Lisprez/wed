@@ -616,14 +616,15 @@ rope 按字符索引，多字节字符落在匹配内部和匹配之间时最容
 `cargo bench --bench render` 的 `matching: matching_partner_for_render, unclosed`
 （1 MiB，n=400）：
 
-| 语料 | 改前 p50 | 改后 p50 |
-|---|---:|---:|
-| wide | 1.120 ms | 0.242 ms |
-| tabs | 0.617 ms | 0.129 ms |
-| prose | 0.614 ms | 0.129 ms |
+| 语料 | 改前 p50 | 外向遍历后（窗口仍 65536） | 收紧窗口后（4096） |
+|---|---:|---:|---:|
+| wide | 1.120 ms | 0.242 ms | 0.015 ms |
+| tabs | 0.617 ms | 0.129 ms | 0.007 ms |
+| prose | 0.614 ms | 0.129 ms | 0.008 ms |
 
-wide 语料达到 1/3 的门槛用了两步：外向遍历本身把 1.12 ms 降到 0.242 ms，收紧
-窗口后再降到微秒量级。注意**窗口外的配对不再高亮**，这是有界查询已声明的语义，
+两步各自都过门槛：外向遍历把 wide 的 1.12 ms 降到 0.242 ms（已优于 1/3），收紧
+窗口后全部落到 10 µs 量级，远低于 100 µs 的验收线，帧成本从此与语料密度脱钩。
+注意**窗口外的配对不再高亮**，这是有界查询已声明的语义，
 `a_bounded_partner_search_gives_up_past_the_window` 与
 `the_unbounded_partner_search_is_the_default` 两个测试把这条界线钉在常量上。
 
