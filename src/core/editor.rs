@@ -464,9 +464,9 @@ impl Editor {
     /// The document is read whole to run the matcher over. A pattern can match across
     /// any distance -- `a.*b` on a large file -- so a chunked scan would have to
     /// handle both that and line anchors, and getting the seam wrong would silently
-    /// miss matches. The text is released as soon as the match positions are known,
-    /// and the result is built by editing rather than by concatenating, so the peak is
-    /// the rope plus one copy of the text.
+    /// miss matches. The whole-text copy is dropped as soon as the match positions
+    /// are known, and the result is built by editing rather than by concatenating,
+    /// so the peak is the rope plus one copy of the text.
     pub fn substitute(&mut self, substitution: &Substitution) -> usize {
         let text = self.document.to_string();
         let byte_ranges = substitution.match_ranges(&text);
@@ -480,6 +480,9 @@ impl Editor {
         // out to be the needle itself gets recognised.
         let replacement = substitution.replacement();
         let ranges = to_char_ranges(&text, &byte_ranges);
+        // The ranges are owned now, so the whole-text copy can go before the
+        // edit loop rather than lingering to the end of the function.
+        drop(text);
         // How many the pattern matched, which is what gets reported. It is not the
         // same as how many edits were made: a match whose text already equals the
         // replacement is skipped, so `s/one/one/g` matches three times, changes
