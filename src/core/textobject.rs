@@ -137,9 +137,12 @@ pub fn matching_partner_within(
     }
     let position = cursor.0.min(document.len_chars() - 1);
     match document.char_at(CharPos(position)) {
-        Some('"' | '\'' | '`') => {
-            matching_quote_partner(document, position, document.char_at(CharPos(position))?)
-        }
+        Some('"' | '\'' | '`') => matching_quote_partner(
+            document,
+            position,
+            document.char_at(CharPos(position))?,
+            limit,
+        ),
         Some('(' | ')' | '[' | ']' | '{' | '}' | '<' | '>') => {
             let range = matching_pair_within(document, CharPos(position), limit)?;
             if position == range.start.0 {
@@ -174,7 +177,7 @@ pub fn matching_partner_outward(
         '[' | ']' => ('[', ']'),
         '{' | '}' => ('{', '}'),
         '<' | '>' => ('<', '>'),
-        '"' | '\'' | '`' => return matching_quote_partner(document, position, character),
+        '"' | '\'' | '`' => return matching_quote_partner(document, position, character, limit),
         _ => return None,
     };
     let is_open = character == open_character;
@@ -250,12 +253,17 @@ pub fn matching_partner_outward(
     None
 }
 
-fn matching_quote_partner(document: &Document, position: usize, quote: char) -> Option<CharPos> {
+fn matching_quote_partner(
+    document: &Document,
+    position: usize,
+    quote: char,
+    limit: usize,
+) -> Option<CharPos> {
     let line = document.pos_to_line_col(CharPos(position)).line;
     let start = document.line_start(line).0;
     let end = document.line_end(line).0;
     let mut positions = Vec::new();
-    for (at, character) in document.chars_from(CharPos(start)) {
+    for (at, character) in document.chars_from(CharPos(start)).take(limit) {
         if at.0 >= end {
             break;
         }
@@ -1108,5 +1116,17 @@ mod tests {
             matching_partner_outward(&document, CharPos(4), PARTNER_SCAN_LIMIT),
             None
         );
+    }
+
+    #[test]
+    fn the_quote_partner_respects_the_window() {
+        let document = Document::from_text("\"a\"xxxx\"b\"");
+        // Cursor on the first quote; its partner is inside a small window.
+        assert_eq!(
+            matching_partner_within(&document, CharPos(0), 16),
+            Some(CharPos(2))
+        );
+        // A zero-width window gives up.
+        assert_eq!(matching_partner_within(&document, CharPos(0), 0), None);
     }
 }
