@@ -72,15 +72,17 @@ pub fn resolve(
 
 /// Half-width, in characters, of the window [`matching_partner_within`] searches.
 ///
-/// The bracket highlight is decoration, so past this distance it gives up rather
-/// than walking a whole large document on every cursor move. On an unmatched
-/// delimiter the exact search runs to end of file, which on a 50 MiB document
-/// costs around half a second per frame.
+/// This is the render highlight's give-up distance, and it is deliberately
+/// short: the highlight is decoration, its whole cost is proportional to the
+/// window, and a few microseconds per frame is worth more than exactness across
+/// a scaled document. A 64 KiB window still left an unmatched delimiter costing
+/// tenths of a millisecond per frame; 4 KiB makes the frame cost independent of
+/// the corpus.
 ///
 /// `%` and the pair text objects keep using the exact unbounded search: there a
 /// missing answer would be a behavioural bug rather than a missing decoration,
 /// and neither runs on a per-frame path.
-pub const PARTNER_SCAN_LIMIT: usize = 1 << 16;
+pub const PARTNER_SCAN_LIMIT: usize = 1 << 12;
 
 pub fn matching_pair(document: &Document, cursor: CharPos) -> Option<CharRange> {
     matching_pair_within(document, cursor, usize::MAX)

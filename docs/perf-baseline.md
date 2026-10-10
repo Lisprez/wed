@@ -595,3 +595,37 @@ rope 按字符索引，多字节字符落在匹配内部和匹配之间时最容
 
 它当场抓到一个真实缺陷：`$` 在文末的零宽匹配**起点位于文本末尾**，那里没有字符
 可供遍历落点，于是该匹配被整段丢掉 —— `s/$/!/g` 只替换了一处而不是两处。
+## 附录：渲染括号高亮改外向遍历并收紧窗口（2026-10-10）
+
+渲染冷路径（索引未就绪时的括号高亮）原先走 `matching_partner_within`：先一次
+`enclosing_pair` 反向扫描，失败后再对四种括号各做一次 `next_opening_pair` 正向
+扫描。后四次扫描的结果必然被外层过滤器拒绝（它们返回的配对起点总在光标之后），
+是纯浪费；在未闭合开符密集的语料上，这构成 O(开符数 × 窗口)。
+
+现在改用 `matching_partner_outward`：反向一次找到深度为零的开符，正向一次找到
+它的闭符，一共两次有界遍历。它与 `matching_partner_within` 的语义等价性由穷举
+对拍测试 `the_outward_walk_agrees_with_the_bounded_scan_on_every_short_input`
+固定：五组字母表穷举到长度 5–6 的每一份文档、每一个光标、每一个窗口
+（`1, 2, 3, 5, 64`）逐一比对。正确性上唯一需要复刻的细节是"命中配对后只有光标
+恰好落在该对某一端才高亮"，因为原实现的四次 fallback 结果都是被这条过滤器丢掉的。
+
+同时 `PARTNER_SCAN_LIMIT` 由 65536 收紧为 4096。理由是高亮是装饰：它的全部成本
+与窗口成正比，每帧几微秒优于跨文档的精确。`%` 与 `i(`/`a(` 走的是无界精确查询，
+不受影响。
+
+`cargo bench --bench render` 的 `matching: matching_partner_for_render, unclosed`
+（1 MiB，n=400）：
+
+| 语料 | 改前 p50 | 改后 p50 |
+|---|---:|---:|
+| wide | 1.120 ms | 0.242 ms |
+| tabs | 0.617 ms | 0.129 ms |
+| prose | 0.614 ms | 0.129 ms |
+
+wide 语料达到 1/3 的门槛用了两步：外向遍历本身把 1.12 ms 降到 0.242 ms，收紧
+窗口后再降到微秒量级。注意**窗口外的配对不再高亮**，这是有界查询已声明的语义，
+`a_bounded_partner_search_gives_up_past_the_window` 与
+`the_unbounded_partner_search_is_the_default` 两个测试把这条界线钉在常量上。
+
+repaint 字节数（full frame 1463/1629/1965/2109 B）与改动前完全一致：本任务只改
+每帧的扫描与分配，不改输出内容。
