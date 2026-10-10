@@ -46,15 +46,9 @@ impl Edit {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Transaction {
     pub edits: Vec<Edit>,
-}
-
-impl Transaction {
-    fn bytes(&self) -> usize {
-        self.edits
-            .iter()
-            .map(|edit| edit.removed.len() + edit.inserted.len())
-            .sum()
-    }
+    /// Total bytes of undoable text, maintained on push so no caller has
+    /// to walk the edit list again.
+    pub bytes: usize,
 }
 
 pub struct History {
@@ -105,15 +99,23 @@ impl History {
 
     pub fn begin(&mut self) {
         if self.active.is_none() {
-            self.active = Some(Transaction { edits: Vec::new() });
+            self.active = Some(Transaction {
+                edits: Vec::new(),
+                bytes: 0,
+            });
         }
     }
 
     pub fn record(&mut self, edit: Edit) {
         if let Some(transaction) = &mut self.active {
+            transaction.bytes += edit.removed.len() + edit.inserted.len();
             transaction.edits.push(edit);
         } else {
-            let transaction = Transaction { edits: vec![edit] };
+            let bytes = edit.removed.len() + edit.inserted.len();
+            let transaction = Transaction {
+                edits: vec![edit],
+                bytes,
+            };
             self.push_undo(transaction);
         }
     }
@@ -192,10 +194,10 @@ impl History {
     /// Commits a transaction and discards the redo stack, which a fresh edit
     /// invalidates.
     fn push_undo(&mut self, transaction: Transaction) {
-        self.held = self.held.saturating_add(transaction.bytes());
+        self.held = self.held.saturating_add(transaction.bytes);
         self.undo_stack.push_back(transaction);
         for abandoned in self.redo_stack.drain(..) {
-            self.held = self.held.saturating_sub(abandoned.bytes());
+            self.held = self.held.saturating_sub(abandoned.bytes);
         }
         self.enforce_budget();
     }
@@ -211,7 +213,7 @@ impl History {
             let Some(oldest) = self.undo_stack.pop_front() else {
                 break;
             };
-            self.held = self.held.saturating_sub(oldest.bytes());
+            self.held = self.held.saturating_sub(oldest.bytes);
         }
     }
 }
