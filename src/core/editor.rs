@@ -2089,12 +2089,10 @@ fn find_search(
 /// standard library's substring search, so the cost is driven by the document
 /// size rather than by one rope lookup per candidate position.
 ///
-/// The scan starts at the chunk holding `from`, not at the start of the document.
-/// Every chunk before it would be read only to be discarded, since a match there
-/// starts before `from` and is rejected anyway; skipping them makes a search from
-/// deep in the document cost what a search from the top costs, rather than adding
-/// a pass over the prefix. Matches that begin before `from` and reach into this
-/// chunk are still rejected, by the `earliest` skip below.
+/// The scan starts exactly at `from`. A match that begins before it is not
+/// wanted, so there is nothing to read or skip before it: the first chunk is
+/// read from `from` rather than from its chunk boundary, which on a search from
+/// deep in the document is the whole prefix of that chunk avoided.
 fn find_first_match(
     document: &Document,
     query: &str,
@@ -2105,24 +2103,21 @@ fn find_first_match(
     let needle = query.chars().count();
     buffer.clear();
     buffer.reserve(SEARCH_CHUNK + needle);
-    let mut chunk = (from / SEARCH_CHUNK) * SEARCH_CHUNK;
-    while chunk < len {
+    // Start exactly at `from`: a match that begins before it is not wanted, so
+    // there is nothing to read or skip before it.
+    let mut position = from;
+    while position < len {
         // Overlap by the needle so matches spanning a boundary stay visible.
-        let end = (chunk + SEARCH_CHUNK + needle - 1).min(len);
+        let end = (position + SEARCH_CHUNK + needle - 1).min(len);
         buffer.clear();
-        document.write_slice(CharRange::new(CharPos(chunk), CharPos(end)), &mut *buffer);
-        // Only the first chunk can begin before `from`, so only it pays the skip.
-        let start_byte = if from > chunk {
-            let skip = from - chunk;
-            buffer.chars().take(skip).map(char::len_utf8).sum()
-        } else {
-            0
-        };
-        if let Some(found) = buffer[start_byte..].find(query) {
-            let at = start_byte + found;
-            return Some(CharPos(chunk + buffer[..at].chars().count()));
+        document.write_slice(
+            CharRange::new(CharPos(position), CharPos(end)),
+            &mut *buffer,
+        );
+        if let Some(found) = buffer.find(query) {
+            return Some(CharPos(position + buffer[..found].chars().count()));
         }
-        chunk += SEARCH_CHUNK;
+        position += SEARCH_CHUNK;
     }
     None
 }
