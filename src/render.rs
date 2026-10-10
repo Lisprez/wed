@@ -593,11 +593,13 @@ impl<'a, W: Write> RowPainter<'a, W> {
         if self.run.is_empty() {
             return Ok(());
         }
-        let text = std::mem::take(self.run);
         match self.style {
-            Some(_) => queue!(self.writer, Print(text), ResetColor)?,
-            None => queue!(self.writer, Print(text))?,
+            Some(_) => queue!(self.writer, Print(&self.run[..]), ResetColor)?,
+            None => queue!(self.writer, Print(&self.run[..]))?,
         }
+        // Borrow and clear rather than `mem::take`: the buffer's capacity must
+        // survive into the next run, or every row reallocates.
+        self.run.clear();
         Ok(())
     }
 
