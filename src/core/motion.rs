@@ -55,13 +55,11 @@ pub fn resolve(document: &Document, cursor: CharPos, motion: Motion, count: usiz
             let line = document.pos_to_line_col(cursor).line;
             let start = document.line_start(line);
             let end = document.line_end(line);
-            let target = (start.0..end.0)
-                .find(|index| {
-                    document
-                        .char_at(CharPos(*index))
-                        .is_some_and(|character| !character.is_whitespace())
-                })
-                .map(CharPos)
+            let target = document
+                .chars_from(start)
+                .take_while(|(position, _)| position.0 < end.0)
+                .find(|(_, character)| !character.is_whitespace())
+                .map(|(position, _)| position)
                 .unwrap_or(start);
             result(
                 target,
