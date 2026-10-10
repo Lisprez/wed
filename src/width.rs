@@ -146,6 +146,11 @@ pub fn width(character: char, column: usize) -> usize {
         return TAB_STOP - (column % TAB_STOP);
     }
     let code = character as u32;
+    // Exact fast path: the smallest code point in either table is 0x0300
+    // (ZERO_WIDTH), so everything below it is one cell without a lookup.
+    if code < 0x0300 {
+        return 1;
+    }
     if in_ranges(&ZERO_WIDTH, code) {
         0
     } else if in_ranges(&WIDE, code) {
