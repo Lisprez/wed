@@ -630,3 +630,44 @@ rope 按字符索引，多字节字符落在匹配内部和匹配之间时最容
 
 repaint 字节数（full frame 1463/1629/1965/2109 B）与改动前完全一致：本任务只改
 每帧的扫描与分配，不改输出内容。
+
+## 附录：性能优化 20 项任务的总验收复核（2026-10-10）
+
+本节是 `docs/perf-optimization-tasks-2026-10-10.md` 全部 20 项完成后的复核记录，
+数字来自本机 `WED_BENCH_SCALE=full cargo bench` 与 `/tmp/wedprobe` 探针。
+
+| 指标 | 优化前实测 | 完成后实测 |
+|---|---:|---:|
+| 病态渲染帧（未闭合开符密集，1 MiB） | 4.48 s | **83.6 µs** |
+| `matching_partner_for_render, unclosed`（1 MiB，wide） | 1.120 ms | **0.015 ms** |
+| 同上（tabs / prose） | 0.617 / 0.614 ms | **0.007 / 0.008 ms** |
+| 打字 CPU（50 MiB，5 键/秒） | 29–37 % 核心 | **0.0 %** |
+| PairIndex 内存（50 MiB 密集） | 103 MiB | **77 MiB** |
+| PairIndex 内存（50 MiB，code 语料） | — | 12.4 MiB |
+| `pairing: index resident`（1 MiB，code） | 346 KiB | 256 KiB |
+| 每帧堆分配 | 66 | 1 |
+| 50 MiB 加载 | 10.7 ms | 10.2 ms（新测） |
+| 加载后内存 / 文件大小 | 约 1.13 | 1.13–1.14 倍 |
+| `cargo test --all-targets`（debug） | 曾 panic | 全绿，139 + 41 通过 |
+
+对照第 2 节与第 3 节原先超标的三项：
+
+1. **括号高亮（原 468–591 ms）**由 T05（外向遍历）+ T06（窗口 64 KiB → 4 KiB）消除。
+   `matching_partner_for_render, unclosed` 的 p50 从 1.12 ms 降到 15 µs，帧成本与语料
+   密度脱钩；探针在 1.04 MiB 未闭合开符密集语料上测得 83.6 µs/帧（原 4.48 s）。
+2. **`%` 与 `i(`（原 82–225 ms）**由 T09（u32 存储 + parent 链 + O(log) 查询）与
+   T08（worker 尾沿防抖）消除。索引冷时 `pair_index()` 同步构建，热时直接查索引；
+   打字期间 worker 不再重建，CPU 从 24.5 % 降到 0.0 %（探针 `tap 50 200 6`）。
+3. **每帧堆分配（66 → 1）**由 T04 达成：`RowPainter::flush` 借出后 `clear` 而不是
+   `mem::take`，缓冲容量跨 run 复用。repaint 字节数（1463/1629/1965/2109 B）与改动前
+   完全一致，本项只改分配不改输出。
+
+语义等价性由三个对拍测试固定，全部穷举或大规模随机：
+`the_outward_walk_agrees_with_the_bounded_scan_on_every_short_input`（T05）、
+`the_stack_scan_agrees_with_the_reference_at_every_limit`（T10）、
+`the_index_agrees_with_the_scan_on_random_input`（T09，150 轮随机文档逐位置对拍）。
+
+T17（`tag_object` 双向扫描重写）为可选项，本次**未实施**：反向阶段需要精确复刻
+参考实现的贪心标签起点判定，而该判定在跨越多标签时的行为与 TAG_BODY_LIMIT 交互
+复杂，风险与收益不成比例。T16 已修掉游离 `<` 中断整个搜索的正确性悬崖并复用
+标签体缓冲，保留其成果。
