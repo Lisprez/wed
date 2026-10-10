@@ -37,10 +37,10 @@ listed there.
 
 | Measurement | Result | Source |
 | :--- | :--- | :--- |
-| Load 1 MiB into the rope | ~0.20 ms | `cargo bench --bench edit` |
+| Load 1 MiB into the rope | ~0.20 ms | `docs/perf-baseline.md` §1 |
 | Load 50 MiB into the rope | ~10.2 ms (target < 1 s) | `docs/perf-baseline.md` §1 |
 | Ordinary keystroke, 50 MiB | < 0.002 ms p95 | `docs/perf-baseline.md` §2 |
-| Memory after loading | ~1.13–1.14× the file size | `cargo bench --bench alloc` |
+| Memory after loading | ~1.13–1.14× the file size | `docs/perf-baseline.md` §3.5 |
 | One rendered frame (22 rows) | ~0.017 ms | `docs/perf-baseline.md` §5 |
 
 *Note: rendering and ordinary editing touch only the visible rows and the edited

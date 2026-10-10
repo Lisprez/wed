@@ -64,6 +64,11 @@ WED_BENCH_SCALE=full cargo bench          # 追加 50 MiB 语料
 加载比目标快约 95 倍。`Editor::from_text` 的成本几乎全部在 ropey 建立
 字节/字符/行三套索引上，与语料种类无关。保存受限于实际写盘速度。
 
+CI 的 benchmark 作业只跑 1 MiB 语料（`cargo bench --bench edit`），那里的
+`load: build editor from <corpus>` 为 p50 **0.192–0.198 ms**（code / wide /
+tabs / prose 各语料接近一致，理由同上）。README 引用的「加载 1 MiB 约 0.20 ms」
+即出自这一行；本地重跑 `WED_BENCH_SCALE=full cargo bench` 则可复现上表的 50 MiB 数字。
+
 ## 2. 普通编辑按键（50 MiB，prose 语料）
 
 | 场景 | p50 | p95 |
