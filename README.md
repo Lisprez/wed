@@ -1,36 +1,52 @@
 # 🛡️ wed
 
-[![Performance](https://img.shields.io/badge/Latency-0.68ms-brightgreen)](#-performance-benchmarks)
+[![Performance](https://img.shields.io/badge/Performance-verified-brightgreen)](docs/perf-baseline.md)
 [![Security](https://img.shields.io/badge/Microsoft_Defender-Verified_Clean-blue)](#-security--false-positive-verification)
 [![Language](https://img.shields.io/badge/Built_With-Rust-orange)](https://www.rust-lang.org/)
 
-wed is an ultra-lightweight, blazing-fast, terminal-based text editor built from scratch in Rust. Powered by a high-performance **Gap Buffer architecture**, wed delivers instant, constant-time $O(1)$ local text insertion and deletion, making it highly responsive even under massive document loads.
+wed is a lightweight, terminal-based text editor written from scratch in Rust.
+The text is stored in a [rope](https://github.com/cessen/ropey), and every edit
+the editor performs is local: it touches only the characters being changed, so a
+keystroke costs the same whether the document is one line or fifty megabytes.
 
-Designed for developers who value minimal resource consumption, extreme speed, and absolute clean security.
+Every performance claim in this README is measured by `cargo bench` and recorded,
+with the commands that reproduce it, in [docs/perf-baseline.md](docs/perf-baseline.md).
 
 ---
 
 ## 🔥 Key Features
 
-- **Blazing Fast Startup:** Boots and runs in sub-millisecond times ($ pprox 0.68	ext{ ms}$).
-- **Gap Buffer Architecture:** Engineered for highly efficient text manipulation with $O(1)$ scaling metrics for local edits.
-- **Micro Memory Footprint:** Extremely lean, consuming less than $2	ext{ MB}$ of RAM at baseline idle state.
-- **Cross-Platform Power:** Natively compiled for both Windows (`.exe`) and Arch Linux.
-- **100% Transparent & Secure:** Independently analyzed and fully whitelisted by major security vendors.
+- **Local edits measured at microseconds.** `i<char><Esc>`, `x`, `j`/`k`, `w`/`b`
+  and `goto_line` all stay under 0.002 ms p95 on a 50 MiB document; the cost is
+  the rope's, not the file's.
+- **Rope storage.** Text lives in a balanced tree of chunks, so an edit rewrites
+  a chunk rather than the document, and undo remembers only what changed.
+- **Rendering cost independent of file size.** A frame paints only the visible
+  rows, so it costs the same on 1 MiB and 50 MiB.
+- **Cross-platform:** Windows (`.exe`) and Linux.
+- **100% transparent & secure:** open-source, and independently analyzed and
+  whitelisted by major security vendors.
 
 ---
 
 ## 🚀 Performance Benchmarks
 
-wed has been programmatically stressed with heavy text loads up to **50 MB** under native production environments. The results prove its architectural efficiency:
+wed has been stressed with document loads up to **50 MB**. All figures below are
+from `docs/perf-baseline.md`; every one of them is reproducible with the commands
+listed there.
 
-| File Size | Load Latency ($T_{	ext{start}}$) | RAM Footprint ($M_{	ext{active}}$) | Scaling Efficiency |
-| :--- | :--- | :--- | :--- |
-| **1 MB** | 0.68 ms | 6.34 MB | Baseline ($O(1)$ local window) |
-| **10 MB** | 0.39 ms | 42.34 MB | $O(N)$ Sequential Map |
-| **50 MB** | 0.45 ms | 232.20 MB | Lean Array allocation |
+| Measurement | Result | Source |
+| :--- | :--- | :--- |
+| Load 1 MiB into the rope | ~0.20 ms | `cargo bench --bench edit` |
+| Load 50 MiB into the rope | ~10.2 ms (target < 1 s) | `docs/perf-baseline.md` §1 |
+| Ordinary keystroke, 50 MiB | < 0.002 ms p95 | `docs/perf-baseline.md` §2 |
+| Memory after loading | ~1.13–1.14× the file size | `cargo bench --bench alloc` |
+| One rendered frame (22 rows) | ~0.017 ms | `docs/perf-baseline.md` §5 |
 
-*Note: Edit latencies inside the text editing viewport remain constant-time $O(1)$ regardless of file boundaries due to the spatial locality of the Gap Buffer.*
+*Note: rendering and ordinary editing touch only the visible rows and the edited
+region respectively, so their cost does not grow with the file. See
+`docs/perf-baseline.md` for the full tables, the known exceptions (horizontal
+scrolling on a long line), and how to reproduce every number.*
 
 ---
 
