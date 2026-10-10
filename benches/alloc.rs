@@ -40,11 +40,17 @@ unsafe impl GlobalAlloc for Counting {
         let grown = System.realloc(pointer, layout, new_size);
         if !grown.is_null() {
             // The old block is released and the new one taken, so the live delta
-            // is the difference rather than either size alone.
-            let live = LIVE.fetch_add(new_size, Relaxed) + new_size;
-            let live = live.saturating_sub(layout.size());
-            LIVE.store(live, Relaxed);
-            PEAK.fetch_max(live, Relaxed);
+            // is the difference rather than either size alone. `fetch_update`
+            // keeps concurrent updates (the index worker frees on its own
+            // thread) from being lost, which a fetch_add + store pair does not.
+            let grown_by = new_size.saturating_sub(layout.size());
+            let shrunk_by = layout.size().saturating_sub(new_size);
+            if let Ok(previous) = LIVE.fetch_update(Relaxed, Relaxed, |live| {
+                Some(live.saturating_add(grown_by).saturating_sub(shrunk_by))
+            }) {
+                let now = previous.saturating_add(grown_by).saturating_sub(shrunk_by);
+                PEAK.fetch_max(now, Relaxed);
+            }
         }
         grown
     }
@@ -63,11 +69,11 @@ fn bench_load_peak(_corpus: Corpus, text: &str) {
     let whole_string = {
         let before = live();
         let owned = text.to_string();
-        let string_only = live() - before;
+        let string_only = live().saturating_sub(before);
 
         let before = live();
         let document = wed::core::Editor::from_text(&owned);
-        let rope = live() - before;
+        let rope = live().saturating_sub(before);
         println!(
             "{:<52} {:>9} KiB for the file as a String",
             "load: whole-file read",
@@ -95,7 +101,7 @@ fn bench_load_peak(_corpus: Corpus, text: &str) {
     for piece in whole_string.as_bytes().chunks(1 << 16) {
         document.append_str(std::str::from_utf8(piece).unwrap_or(""));
     }
-    let streamed = live() - before;
+    let streamed = live().saturating_sub(before);
     println!(
         "{:<52} {:>9} KiB held at once ({:.2}x the file)",
         "load: peak with the streaming path",
@@ -118,7 +124,7 @@ fn bench_pair_index_memory(_corpus: Corpus, text: &str) {
             .pairs(wed::core::PairKind::Parenthesis)
             .len(),
     );
-    let retained = live() - before;
+    let retained = live().saturating_sub(before);
     let openers = document
         .pair_index()
         .open_count(wed::core::PairKind::Parenthesis);
@@ -134,7 +140,7 @@ fn bench_pair_index_memory(_corpus: Corpus, text: &str) {
     println!(
         "{:<52} {:>9} KiB released on the next edit",
         "pairing: index released by invalidate",
-        (baseline - live()) / 1024
+        (baseline.saturating_sub(live())) / 1024
     );
 }
 
@@ -176,7 +182,7 @@ fn run(corpus: Corpus, target_bytes: usize, text: &str) {
 fn bench_load(_corpus: Corpus, text: &str) {
     let baseline = live();
     let editor = wed::core::Editor::from_text(text);
-    let retained = live() - baseline;
+    let retained = live().saturating_sub(baseline);
     report(
         "load: editor resident after loading the document",
         retained,
@@ -191,7 +197,7 @@ fn bench_insert(_corpus: Corpus, text: &str) {
     settle();
     let baseline = live();
     editor.insert_text_for_test("hello");
-    let retained = live() - baseline;
+    let retained = live().saturating_sub(baseline);
     report(
         "insert: retained after i<text><Esc>",
         retained,
@@ -211,7 +217,7 @@ fn bench_substitute(_corpus: Corpus, text: &str) {
     settle();
     let baseline = live();
     let replaced = editor.replace_literal(&needle, "zz", true);
-    let retained = live() - baseline;
+    let retained = live().saturating_sub(baseline);
     report(
         &format!("substitute: retained after s/{needle}/zz/g ({replaced} hits)"),
         retained,
@@ -239,7 +245,7 @@ fn bench_session_growth(_corpus: Corpus, text: &str) {
     for _ in 0..12 {
         editor.insert_text_for_test(&chunk);
     }
-    let live_delta = live() - before;
+    let live_delta = live().saturating_sub(before);
     println!(
         "{:<52} {:>9} KiB undo text, budget {} KiB, {:.2}x the file, {} KiB live growth",
         "session: 12 x 0.5 MiB inserts",
@@ -263,12 +269,14 @@ fn bench_regex_substitute_peak(_corpus: Corpus, text: &str) {
     settle();
     let before = live();
     let replaced = editor.substitute(&substitution);
-    let peak_growth = PEAK.load(std::sync::atomic::Ordering::Relaxed) - before;
+    let peak_growth = PEAK
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .saturating_sub(before);
     println!(
         "{:<52} {:>9} KiB retained ({:.2}x the file), {:>9} KiB peak, {replaced} matches",
         "substitute: regex form",
-        (live() - before) / 1024,
-        (live() - before) as f64 / text.len() as f64,
+        (live().saturating_sub(before)) / 1024,
+        (live().saturating_sub(before)) as f64 / text.len() as f64,
         peak_growth / 1024
     );
 }
@@ -282,7 +290,7 @@ fn bench_undo(_corpus: Corpus, text: &str) {
     settle();
     let baseline = live();
     editor.handle_key(wed::core::Key::Char('u'));
-    let retained = live() - baseline;
+    let retained = live().saturating_sub(baseline);
     report(
         "undo: retained after undoing it",
         retained,
